@@ -340,9 +340,23 @@ fn item_xml(ctx: &Ctx, rel: &str, name: &str, size: u64, subs: &[String], base: 
     // Subtitles. VLC turns every <res> with a text/* protocolInfo into a
     // subtitle track, so all of them are offered. Samsung TVs read
     // sec:CaptionInfoEx, which only holds one (the exact-name match).
-    let (path, transcoded) = if native { (format!("/{}", url_encode_path(rel)), false) } else { ctx.play_path(rel) };
-    // A transcoded stream already carries its subtitles as tracks.
-    let subs = if transcoded { Vec::new() } else { crate::http::order_subs(subs, name, ctx.sub_lang.as_deref()) };
+    let (mut path, transcoded) = if native { (format!("/{}", url_encode_path(rel)), false) } else { ctx.play_path(rel) };
+    // Samsung only lists subtitles inside the file, so it gets a copy with
+    // the subtitle files muxed in (made on first browse, takes a minute).
+    let mut size = size;
+    let mut title = title;
+    let muxed = if native && kind == Kind::Video && !subs.is_empty() { ctx.samsung_copy(rel) } else { None };
+    if let Some(file) = &muxed {
+        path = format!("/_mux/{}", url_encode_path(rel));
+        size = fs::metadata(file).map(|m| m.len()).unwrap_or(size);
+    } else if native
+        && kind == Kind::Video
+        && ctx.tc.zip(safe_join(&ctx.root, rel)).is_some_and(|(tc, (full, _))| tc.muxing(&full))
+    {
+        title = format!("{title} (adding subtitles, open again in a minute)");
+    }
+    // A transcoded or muxed video already carries its subtitles as tracks.
+    let subs = if transcoded || muxed.is_some() { Vec::new() } else { crate::http::order_subs(subs, name, ctx.sub_lang.as_deref()) };
     let mut captions = String::new();
     let mut sub_res = String::new();
     for (i, sub) in subs.iter().enumerate() {
