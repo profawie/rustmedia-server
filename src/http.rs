@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::dlna;
-use crate::transcode::Transcoder;
+use crate::transcode::{CacheState, Transcoder};
 use crate::util::*;
 
 pub struct Ctx {
@@ -28,6 +28,38 @@ impl Ctx {
         });
         let p = url_encode_path(rel);
         if needs_tc { (format!("/_tc/{p}"), true) } else { (format!("/{p}"), false) }
+    }
+
+    /// Sibling subtitle files of the video at `rel` (`Movie.srt`, `Movie.ms.srt`, ...).
+    pub fn sibling_subs(&self, rel: &str) -> Vec<PathBuf> {
+        let rel = rel.trim_matches('/');
+        let parent = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        let Some((dir, _)) = safe_join(&self.root, parent) else { return Vec::new() };
+        read_entries(&dir, parent)
+            .into_iter()
+            .find(|e| e.rel == rel)
+            .map(|e| e.subs.iter().filter_map(|s| safe_join(&self.root, s).map(|(p, _)| p)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Conversion state of a video that needs transcoding (`None` otherwise).
+    pub fn tc_state(&self, rel: &str) -> Option<CacheState> {
+        let tc = self.tc?;
+        let (full, _) = safe_join(&self.root, rel)?;
+        if mime_for(rel).1 != Kind::Video || !tc.needs_transcode(&full) {
+            return None;
+        }
+        Some(tc.state(&full, &self.sibling_subs(rel)))
+    }
+}
+
+/// Short note shown next to a transcoded video's name.
+pub fn tc_note(state: &CacheState) -> String {
+    match state {
+        CacheState::Ready(_) => "TV".into(),
+        CacheState::Converting(p) => format!("TV, converting {:.0}%, no seeking yet", p * 100.0),
+        CacheState::Waiting => "TV, waiting to convert, no seeking yet".into(),
+        CacheState::Failed => "TV, conversion failed, no seeking".into(),
     }
 }
 
@@ -164,17 +196,18 @@ fn handle(ctx: &Ctx, mut stream: TcpStream) -> io::Result<()> {
         if !full.is_file() {
             return respond(&mut stream, "404 Not Found", &[], b"Not found", head);
         }
-        // Sibling subtitle files are muxed into the stream as tracks.
-        let rel = percent_decode(rest, false);
-        let parent = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-        let subs: Vec<PathBuf> = full
-            .parent()
-            .map(|dir| read_entries(dir, parent))
-            .unwrap_or_default()
-            .into_iter()
-            .find(|e| e.rel == rel.trim_matches('/'))
-            .map(|e| e.subs.iter().filter_map(|s| safe_join(&ctx.root, s).map(|(p, _)| p)).collect())
-            .unwrap_or_default();
+        // Sibling subtitle files are muxed into the output as tracks.
+        let subs = ctx.sibling_subs(&percent_decode(rest, false));
+        if let CacheState::Ready(file) = tc.state(&full, &subs) {
+            // Converted copy: a normal file, so Range requests (seeking) work.
+            let len = fs::metadata(&file)?.len();
+            return serve_file(&mut stream, &req, &file, len, head);
+        }
+        // Not converted yet: move it to the front of the queue and stream
+        // it live in the meantime.
+        if !head {
+            tc.enqueue(full.clone(), subs.clone(), true);
+        }
         stream.set_read_timeout(None)?;
         return tc.stream(&mut stream, &full, &subs, head);
     }
@@ -374,8 +407,11 @@ fn playlist(ctx: &Ctx, dir: &Path, rel: &str, base: &str) -> String {
     let mut s = String::from("#EXTM3U\n");
     for f in files {
         let title = f.rel.replace('/', " / ");
-        let (path, tc) = ctx.play_path(&f.rel);
-        let title = if tc { format!("{title} [TV]") } else { title };
+        let (path, _) = ctx.play_path(&f.rel);
+        let title = match ctx.tc_state(&f.rel) {
+            Some(st) => format!("{title} [{}]", tc_note(&st)),
+            None => title,
+        };
         s.push_str(&format!("#EXTINF:-1,{title}\n{base}{path}\n"));
     }
     s
@@ -412,8 +448,8 @@ fn listing(ctx: &Ctx, dir: &Path, rel: &str, base: &str) -> String {
             (c, escape_xml(&e.name), human_size(e.size))
         };
         let copy = if !e.is_dir && is_playable(&e.name) {
-            let (path, tc) = ctx.play_path(&e.rel);
-            let tag = if tc { " (transcoded for TV)" } else { "" };
+            let (path, _) = ctx.play_path(&e.rel);
+            let tag = ctx.tc_state(&e.rel).map(|st| format!(" ({})", tc_note(&st))).unwrap_or_default();
             format!(" <span class=u>{}{}{tag}</span>", escape_xml(base), escape_xml(&path))
         } else {
             String::new()

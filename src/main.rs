@@ -63,6 +63,26 @@ fn parse_args() -> Result<Args, String> {
     Ok(a)
 }
 
+/// Folder for converted videos: `.rustmedia-cache` inside the shared folder
+/// (hidden from listings), or the temp folder if that isn't writable.
+fn cache_dir(root: &std::path::Path) -> PathBuf {
+    let preferred = root.join(".rustmedia-cache");
+    let writable = |d: &std::path::Path| {
+        std::fs::create_dir_all(d).is_ok() && {
+            let probe = d.join(".write-test");
+            let ok = std::fs::write(&probe, b"").is_ok();
+            let _ = std::fs::remove_file(&probe);
+            ok
+        }
+    };
+    if writable(&preferred) {
+        return preferred;
+    }
+    let fallback = std::env::temp_dir().join("rustmedia-cache");
+    let _ = std::fs::create_dir_all(&fallback);
+    fallback
+}
+
 /// Keep the console window open when started by double-click so errors can be read.
 fn fail(msg: &str) -> ! {
     eprintln!("\nERROR: {msg}");
@@ -120,29 +140,35 @@ fn main() {
     };
 
     let tc: Option<&'static transcode::Transcoder> = if args.transcode {
-        transcode::Transcoder::detect(args.encoder.clone()).map(|t| &*Box::leak(Box::new(t)))
+        transcode::Transcoder::detect(args.encoder.clone(), cache_dir(&root)).map(|t| &*Box::leak(Box::new(t)))
     } else {
         None
     };
-    if let Some(tc) = tc {
-        // Probe every video in the background so browsing is fast later.
-        let files: Vec<PathBuf> = media
-            .iter()
-            .filter(|e| util::mime_for(&e.name).1 == util::Kind::Video)
-            .filter_map(|e| util::safe_join(&root, &e.rel).map(|(p, _)| p))
-            .collect();
-        std::thread::spawn(move || {
-            for f in files {
-                tc.probe(&f);
-            }
-        });
-    }
-
     let ctx = Arc::new(http::Ctx {
         root: root.clone(),
         dlna: device,
         tc,
     });
+
+    if let Some(tc) = tc {
+        tc.start_worker();
+        // Probe every video in the background and queue the ones the TV
+        // can't play for conversion, in folder order.
+        let ctx = ctx.clone();
+        let videos: Vec<String> = media
+            .iter()
+            .filter(|e| util::mime_for(&e.name).1 == util::Kind::Video)
+            .map(|e| e.rel.clone())
+            .collect();
+        std::thread::spawn(move || {
+            for rel in videos {
+                let Some((full, _)) = util::safe_join(&ctx.root, &rel) else { continue };
+                if tc.needs_transcode(&full) {
+                    tc.enqueue(full, ctx.sibling_subs(&rel), false);
+                }
+            }
+        });
+    }
 
     println!("============================================================");
     println!(" RustMedia {}  -  media server for VLC", env!("CARGO_PKG_VERSION"));
@@ -172,8 +198,11 @@ fn main() {
     match tc {
         Some(t) => {
             println!(" Transcoding: on ({}, encoder {}).", t.ffmpeg_path().display(), t.encoder());
-            println!("   HEVC/x265, 10-bit, VP9 and AV1 videos are converted to H.264.");
-            println!("   Seeking is not available while a video is transcoded.");
+            println!("   HEVC/x265, 10-bit, VP9 and AV1 videos are converted to H.264 MP4");
+            println!("   in the background, one at a time, into:");
+            println!("   {}", t.cache_dir().display().to_string().trim_start_matches(r"\\?\"));
+            println!("   Once converted they can be seeked. Before that they still play,");
+            println!("   streamed live, but without seeking.");
         }
         None if args.transcode => {
             println!(" Transcoding: off (ffmpeg.exe + ffprobe.exe not found next to");
