@@ -79,6 +79,19 @@ rustmedia.exe [FOLDER] [--port N] [--name NAME] [--no-dlna]
 
 ## Building
 
+On Windows, run the build script (needs Rust from https://rustup.rs):
+
+```
+.\build.ps1                  # run tests, build, copy rustmedia.exe here
+.\build.ps1 -SkipTests       # build only
+.\build.ps1 -Output D:\Movies # also copy the exe into your video folder
+.\build.ps1 -Gnu             # use the GNU toolchain if MSVC Build Tools aren't installed
+```
+
+If PowerShell refuses to run scripts: `powershell -ExecutionPolicy Bypass -File .\build.ps1`.
+
+Or by hand:
+
 ```
 cargo build --release                                     # on Windows
 cargo build --release --target x86_64-pc-windows-gnu      # cross-compile from Linux (needs mingw-w64)
