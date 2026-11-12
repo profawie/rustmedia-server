@@ -313,19 +313,22 @@ fn item_xml(rel: &str, name: &str, size: u64, subs: &[String], base: &str) -> St
         _ => "object.item.videoItem",
     };
     let title = name.rsplit_once('.').map(|(t, _)| t).filter(|t| !t.is_empty()).unwrap_or(name);
-    // Subtitles: VLC (and Samsung TVs) read sec:CaptionInfoEx and attach the
-    // file as a subtitle track.
+    // Subtitles. VLC turns every <res> with a text/* protocolInfo into a
+    // subtitle track, so all of them are offered. Samsung TVs read
+    // sec:CaptionInfoEx, which only holds one (the exact-name match).
     let mut captions = String::new();
-    for sub in subs {
+    let mut sub_res = String::new();
+    for (i, sub) in subs.iter().enumerate() {
         let ext = sub.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
-        captions.push_str(&format!(
-            "<sec:CaptionInfoEx sec:type=\"{ext}\">{}</sec:CaptionInfoEx>",
-            escape_xml(&format!("{base}/{}", url_encode_path(sub)))
-        ));
+        let url = escape_xml(&format!("{base}/{}", url_encode_path(sub)));
+        if i == 0 {
+            captions = format!("<sec:CaptionInfoEx sec:type=\"{ext}\">{url}</sec:CaptionInfoEx>");
+        }
+        sub_res.push_str(&format!("<res protocolInfo=\"http-get:*:text/{ext}:*\">{url}</res>"));
     }
     format!(
         "<item id=\"{}\" parentID=\"{}\" restricted=\"1\"><dc:title>{}</dc:title><upnp:class>{class}</upnp:class>\
-         {captions}<res protocolInfo=\"http-get:*:{mime}:{CONTENT_FEATURES}\" size=\"{size}\">{}</res></item>",
+         {captions}<res protocolInfo=\"http-get:*:{mime}:{CONTENT_FEATURES}\" size=\"{size}\">{}</res>{sub_res}</item>",
         escape_xml(rel),
         escape_xml(&parent_id(rel)),
         escape_xml(title),

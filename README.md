@@ -46,8 +46,8 @@ Movie.srt        (or Movie.en.srt, Movie.ms.srt; .srt, .vtt, .ass and .ssa work)
 ```
 
 - **Option B (UPnP / Local Network):** the subtitle is attached to the video
-  automatically. If it isn't shown, open VLC's subtitle menu and pick the
-  track (VLC loads one subtitle file per video, the exact-name match first).
+  automatically. Every matching file becomes a track (e.g. `Movie.srt` and
+  `Movie.ms.srt`); pick the one you want in VLC under Subtitle > Sub Track.
 - **Option A (playlist URL):** VLC does not accept subtitle files from a
   playlist over the network, so use Option B, use subtitles embedded in the
   file (e.g. MKV), or on the laptop use Subtitle > Add Subtitle File.
