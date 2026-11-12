@@ -37,11 +37,36 @@ impl Ctx {
         let rel = rel.trim_matches('/');
         let parent = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
         let Some((dir, _)) = safe_join(&self.root, parent) else { return Vec::new() };
+        let name = rel.rsplit('/').next().unwrap_or(rel);
         read_entries(&dir, parent)
             .into_iter()
             .find(|e| e.rel == rel)
-            .map(|e| e.subs.iter().filter_map(|s| safe_join(&self.root, s).map(|(p, _)| p)).collect())
+            .map(|e| {
+                order_subs(&e.subs, name, self.sub_lang.as_deref())
+                    .iter()
+                    .filter_map(|s| safe_join(&self.root, s).map(|(p, _)| p))
+                    .collect()
+            })
             .unwrap_or_default()
+    }
+
+    /// For Samsung: the copy of `rel` with its subtitle files muxed in, if
+    /// made. Otherwise starts making it and returns `None`.
+    pub fn samsung_copy(&self, rel: &str) -> Option<PathBuf> {
+        let tc = self.tc?;
+        if mime_for(rel).1 != Kind::Video {
+            return None;
+        }
+        let (full, _) = safe_join(&self.root, rel)?;
+        let subs = self.sibling_subs(rel);
+        if subs.is_empty() {
+            return None;
+        }
+        let found = tc.muxed(&full, &subs);
+        if found.is_none() {
+            tc.start_mux(full, subs);
+        }
+        found
     }
 
     /// Conversion state of a video that needs transcoding (`None` otherwise).
@@ -236,6 +261,20 @@ fn handle(ctx: &Ctx, mut stream: TcpStream) -> io::Result<()> {
         }
         stream.set_read_timeout(None)?;
         return tc.stream(&mut stream, &full, &subs, head);
+    }
+
+    if let Some(rest) = req.path.strip_prefix("/_mux/") {
+        // Samsung: the video with its subtitle files inside (see samsung_copy).
+        let rel = percent_decode(rest, false);
+        let Some((full, rel)) = safe_join(&ctx.root, &rel) else {
+            return respond(&mut stream, "400 Bad Request", &[], b"bad path", head);
+        };
+        let file = ctx.samsung_copy(&rel).unwrap_or(full);
+        let Ok(meta) = fs::metadata(&file) else {
+            return respond(&mut stream, "404 Not Found", &[], b"Not found", head);
+        };
+        let extra = samsung_headers(ctx, &req, &rel, local);
+        return serve_file(&mut stream, &req, &file, meta.len(), head, &extra);
     }
 
     if req.path == "/playlist.m3u" || req.path == "/playlist.m3u8" {

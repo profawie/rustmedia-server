@@ -63,16 +63,29 @@ Samsung Tizen TVs and Smart Monitors (e.g. M7) have a built-in DLNA player:
    **RustMedia - <folder> (<PC>)**, browse to the video and play it.
 
 Samsung players decode HEVC, MKV and 10-bit video themselves, so they get
-the original files (no conversion, seeking works). They show **one**
-subtitle file, sent with Samsung's `CaptionInfo.sec` extension. To choose
-which one, start with `--sub-lang`:
+the original files (no conversion, seeking works).
+
+Samsung players only list subtitles that are *inside* the video file, and
+ignore `.srt` files next to it. So when a video has subtitle files,
+RustMedia (with ffmpeg available) makes a copy of it with those subtitles
+added as tracks, e.g. **Malay** from `Movie.ms.srt`. Nothing is re-encoded,
+so this takes about as long as copying the file. It starts the first time
+the monitor opens the folder; meanwhile the video's name ends with
+"(adding subtitles, open again in a minute)". The copies are kept in
+`.rustmedia-cache` and need as much disk space as the originals.
+
+Choose a track in the player's **Subtitle Settings**. The track from
+`--sub-lang` is first and marked default:
 
 ```
-rustmedia.exe --sub-lang ms      # prefer Movie.ms.srt over Movie.srt
+rustmedia.exe --sub-lang ms      # Movie.ms.srt first
 ```
 
-If you only watch on a Samsung, `--no-transcode` saves the laptop from
-converting videos in the background.
+Without ffmpeg the monitor gets one subtitle file through Samsung's
+`CaptionInfo.sec` extension, which some models ignore.
+
+`--no-transcode` turns ffmpeg off completely, so it also stops the
+subtitle copies for Samsung.
 
 ## Transcoding (HEVC / x265 videos on TVs)
 

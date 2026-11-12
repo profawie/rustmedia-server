@@ -40,6 +40,9 @@ pub struct Transcoder {
     probes: Mutex<HashMap<PathBuf, (SystemTime, Option<Probe>)>>,
     jobs: Mutex<Jobs>,
     wake: Condvar,
+    /// Sources whose subtitle-muxed MKV copy is being made right now.
+    muxing: Mutex<HashSet<PathBuf>>,
+    mux_failed: Mutex<HashSet<PathBuf>>,
 }
 
 #[derive(Default)]
@@ -110,6 +113,8 @@ impl Transcoder {
             probes: Mutex::new(HashMap::new()),
             jobs: Mutex::new(Jobs::default()),
             wake: Condvar::new(),
+            muxing: Mutex::new(HashSet::new()),
+            mux_failed: Mutex::new(HashSet::new()),
         })
     }
 
@@ -258,6 +263,10 @@ impl Transcoder {
     /// Cache file for a source + its subtitles. The name changes whenever
     /// any of them is modified, so stale conversions are never served.
     fn cache_file(&self, src: &Path, subs: &[PathBuf]) -> PathBuf {
+        self.cache_name(src, subs, &self.encoder, "mp4")
+    }
+
+    fn cache_name(&self, src: &Path, subs: &[PathBuf], kind: &str, ext: &str) -> PathBuf {
         let mut h = DefaultHasher::new();
         for p in std::iter::once(src).chain(subs.iter().map(PathBuf::as_path)) {
             p.hash(&mut h);
@@ -266,9 +275,9 @@ impl Transcoder {
                 m.modified().ok().hash(&mut h);
             }
         }
-        self.encoder.hash(&mut h);
+        kind.hash(&mut h);
         let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        self.cache_dir.join(format!("{stem}.{:016x}.mp4", h.finish()))
+        self.cache_dir.join(format!("{stem}.{:016x}.{ext}", h.finish()))
     }
 
     pub fn state(&self, src: &Path, subs: &[PathBuf]) -> CacheState {
@@ -396,6 +405,96 @@ impl Transcoder {
             let reason = errors.lines().last().unwrap_or("ffmpeg stopped").trim().to_string();
             println!(" Conversion failed for {name}: {reason}");
             false
+        }
+    }
+
+    // ------------------------------------------------------------ subtitle mux
+
+    /// Copy of `src` with the external subtitle files added as MKV tracks.
+    /// Samsung TVs only list subtitles inside the file, never a sibling .srt.
+    fn mux_file(&self, src: &Path, subs: &[PathBuf]) -> PathBuf {
+        self.cache_name(src, subs, "mux1", "mkv")
+    }
+
+    /// The muxed copy, if it has been made.
+    pub fn muxed(&self, src: &Path, subs: &[PathBuf]) -> Option<PathBuf> {
+        let f = self.mux_file(src, subs);
+        f.is_file().then_some(f)
+    }
+
+    /// True while the muxed copy of `src` is being made.
+    pub fn muxing(&self, src: &Path) -> bool {
+        self.muxing.lock().unwrap().contains(src)
+    }
+
+    /// Make the muxed copy in the background (streams are copied, not
+    /// re-encoded, so it takes about as long as copying the file).
+    pub fn start_mux(&'static self, src: PathBuf, subs: Vec<PathBuf>) {
+        if subs.is_empty() || self.muxed(&src, &subs).is_some() || self.mux_failed.lock().unwrap().contains(&src) {
+            return;
+        }
+        if !self.muxing.lock().unwrap().insert(src.clone()) {
+            return;
+        }
+        std::thread::spawn(move || {
+            if !self.mux(&src, &subs) {
+                self.mux_failed.lock().unwrap().insert(src.clone());
+            }
+            self.muxing.lock().unwrap().remove(&src);
+        });
+    }
+
+    fn mux_cmd(&self, src: &Path, subs: &[PathBuf], out: &Path) -> Command {
+        let mut cmd = Command::new(&self.ffmpeg);
+        cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"]).arg(src);
+        for sub in subs {
+            cmd.arg("-i").arg(sub);
+        }
+        cmd.args(["-map", "0:v:0", "-map", "0:a?"]);
+        // External subtitles first (the preferred language leads), then the
+        // embedded ones, then attachments such as fonts for ASS subtitles.
+        for i in 0..subs.len() {
+            cmd.args(["-map", &format!("{}:s:0", i + 1)]);
+        }
+        cmd.args(["-map", "0:s?", "-map", "0:t?", "-c", "copy"]);
+        cmd.args(["-disposition:s", "0", "-disposition:s:0", "default"]);
+        for (i, sub) in subs.iter().enumerate() {
+            let tag = sub_tag(src, sub);
+            let (code, title) = match iso639_2(&tag) {
+                Some((code, name)) => (Some(code), name.to_string()),
+                None if tag.is_empty() => (None, "External".to_string()),
+                None => (None, tag.clone()),
+            };
+            cmd.args([format!("-metadata:s:s:{i}"), format!("title={title}")]);
+            if let Some(code) = code {
+                cmd.args([format!("-metadata:s:s:{i}"), format!("language={code}")]);
+            }
+        }
+        cmd.args(["-y", "-f", "matroska"]).arg(out);
+        cmd
+    }
+
+    fn mux(&self, src: &Path, subs: &[PathBuf]) -> bool {
+        let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let target = self.mux_file(src, subs);
+        let part = target.with_extension("mkv.part");
+        println!(" Adding subtitles for Samsung: {name}");
+        let started = Instant::now();
+        let out = self.mux_cmd(src, subs, &part).stdin(Stdio::null()).stdout(Stdio::null()).output();
+        match out {
+            Ok(o) if o.status.success() && std::fs::rename(&part, &target).is_ok() => {
+                println!(" Subtitles added: {name} ({:.0} s)", started.elapsed().as_secs_f64());
+                true
+            }
+            other => {
+                let _ = std::fs::remove_file(&part);
+                let reason = match other {
+                    Ok(o) => String::from_utf8_lossy(&o.stderr).lines().last().unwrap_or("ffmpeg stopped").trim().to_string(),
+                    Err(e) => e.to_string(),
+                };
+                println!(" Could not add subtitles to {name}: {reason}");
+                false
+            }
         }
     }
 }
