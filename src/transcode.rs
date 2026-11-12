@@ -1,33 +1,66 @@
-//! On-the-fly transcoding with ffmpeg for videos the TV can't decode
-//! (HEVC/x265, 10-bit H.264, VP9, AV1, ...). Compatible files are still
-//! served as-is with seeking; only incompatible ones go through ffmpeg.
+//! Transcoding with ffmpeg for videos the TV can't decode (HEVC/x265,
+//! 10-bit H.264, VP9, AV1, ...). Compatible files are served as-is.
+//!
+//! Incompatible videos are converted in the background, one at a time, to
+//! a normal MP4 in a cache folder. Once converted, that file is served with
+//! Range support, so seeking works. A video requested before it is ready
+//! jumps to the front of the queue and is streamed live meanwhile (no
+//! seeking in that case).
 //!
 //! ffmpeg.exe / ffprobe.exe are looked up next to rustmedia.exe first, then
-//! on PATH. Output is fragmented MP4: video re-encoded to H.264, every
-//! audio track as AAC stereo, and the subtitles (embedded text ones plus
-//! sibling .srt/.ass/.vtt files) muxed in as selectable tracks.
+//! on PATH. Output: H.264 video (max 1080p), every audio track as AAC
+//! stereo, and the subtitles (embedded text ones plus sibling
+//! .srt/.ass/.vtt files) as selectable mov_text tracks.
 //!
 //! Why this shape (all checked against VLC 3.0):
 //! - subtitles must travel inside the stream: VLC never starts the video
 //!   decoder when an external subtitle is attached to an unseekable stream;
 //! - VLC's MKV demuxer can't read an unseekable stream, while its MP4
-//!   demuxer handles fragmented MP4 fine;
+//!   demuxer handles fragmented MP4 fine (used for the live fallback);
 //! - fragmented MP4 needs audio parameters up front, which E-AC3 copied from
 //!   the source doesn't provide, so audio is re-encoded to AAC.
+//!
+//! ffmpeg runs in rustmedia's console, so Ctrl+C or closing the window
+//! stops it too; an unfinished `.part` file is simply redone next time.
 
-use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
-use std::time::SystemTime;
+use std::sync::{Condvar, Mutex};
+use std::time::{Instant, SystemTime};
 
 pub struct Transcoder {
     ffmpeg: PathBuf,
     ffprobe: PathBuf,
     encoder: String,
-    cache: Mutex<HashMap<PathBuf, (SystemTime, Option<Probe>)>>,
+    cache_dir: PathBuf,
+    probes: Mutex<HashMap<PathBuf, (SystemTime, Option<Probe>)>>,
+    jobs: Mutex<Jobs>,
+    wake: Condvar,
+}
+
+#[derive(Default)]
+struct Jobs {
+    queue: VecDeque<Job>,
+    /// Source being converted and its progress (0.0-1.0).
+    current: Option<(PathBuf, f32)>,
+    failed: HashSet<PathBuf>,
+}
+
+struct Job {
+    src: PathBuf,
+    subs: Vec<PathBuf>,
+}
+
+/// Where a video stands in the conversion cache.
+pub enum CacheState {
+    Ready(PathBuf),
+    Converting(f32),
+    Waiting,
+    Failed,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -52,16 +85,6 @@ impl Probe {
     }
 }
 
-/// `CREATE_NO_WINDOW`, so ffmpeg doesn't flash a console window on Windows.
-fn quiet(cmd: &mut Command) -> &mut Command {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    cmd
-}
-
 fn find_tool(name: &str) -> Option<PathBuf> {
     let exe = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
     if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
@@ -76,10 +99,22 @@ fn find_tool(name: &str) -> Option<PathBuf> {
 
 impl Transcoder {
     /// Find ffmpeg + ffprobe. Returns `None` if either is missing.
-    pub fn detect(encoder: String) -> Option<Self> {
+    pub fn detect(encoder: String, cache_dir: PathBuf) -> Option<Self> {
         let ffmpeg = find_tool("ffmpeg")?;
         let ffprobe = find_tool("ffprobe")?;
-        Some(Transcoder { ffmpeg, ffprobe, encoder, cache: Mutex::new(HashMap::new()) })
+        Some(Transcoder {
+            ffmpeg,
+            ffprobe,
+            encoder,
+            cache_dir,
+            probes: Mutex::new(HashMap::new()),
+            jobs: Mutex::new(Jobs::default()),
+            wake: Condvar::new(),
+        })
+    }
+
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
     }
 
     pub fn ffmpeg_path(&self) -> &Path {
@@ -93,26 +128,24 @@ impl Transcoder {
     /// Codec info for a file, cached by modification time.
     pub fn probe(&self, path: &Path) -> Option<Probe> {
         let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
-        if let Some((t, p)) = self.cache.lock().unwrap().get(path) {
+        if let Some((t, p)) = self.probes.lock().unwrap().get(path) {
             if *t == mtime {
                 return p.clone();
             }
         }
         let p = self.run_probe(path);
-        self.cache.lock().unwrap().insert(path.to_path_buf(), (mtime, p.clone()));
+        self.probes.lock().unwrap().insert(path.to_path_buf(), (mtime, p.clone()));
         p
     }
 
     fn run_probe(&self, path: &Path) -> Option<Probe> {
-        let out = quiet(
-            Command::new(&self.ffprobe)
-                .args(["-v", "error", "-show_entries", "stream=codec_type,codec_name,pix_fmt:format=duration", "-of", "compact"])
-                .arg(path)
-                .stdin(Stdio::null())
-                .stderr(Stdio::null()),
-        )
-        .output()
-        .ok()?;
+        let out = Command::new(&self.ffprobe)
+            .args(["-v", "error", "-show_entries", "stream=codec_type,codec_name,pix_fmt:format=duration", "-of", "compact"])
+            .arg(path)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
         if !out.status.success() {
             return None;
         }
@@ -136,7 +169,9 @@ impl Transcoder {
         if head {
             return out.flush();
         }
-        let mut child = self.spawn(path, subs)?;
+        let mut cmd = self.encode_cmd(path, subs);
+        cmd.args(["-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1"]);
+        let mut child: Child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
         let res = (|| {
             let mut stdout = child.stdout.take().ok_or_else(|| io::Error::other("no ffmpeg stdout"))?;
             let mut buf = vec![0u8; 256 * 1024];
@@ -154,7 +189,8 @@ impl Transcoder {
         res
     }
 
-    fn spawn(&self, path: &Path, subs: &[PathBuf]) -> io::Result<Child> {
+    /// ffmpeg command with inputs, stream mapping and codecs; the caller adds the output.
+    fn encode_cmd(&self, path: &Path, subs: &[PathBuf]) -> Command {
         let mut cmd = Command::new(&self.ffmpeg);
         cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"]).arg(path);
         for sub in subs {
@@ -214,8 +250,153 @@ impl Transcoder {
                 cmd.args([format!("-metadata:s:s:{idx}"), format!("language={code}")]);
             }
         }
-        cmd.args(["-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1"]);
-        quiet(cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null())).spawn()
+        cmd
+    }
+
+    // ------------------------------------------------------------ cache
+
+    /// Cache file for a source + its subtitles. The name changes whenever
+    /// any of them is modified, so stale conversions are never served.
+    fn cache_file(&self, src: &Path, subs: &[PathBuf]) -> PathBuf {
+        let mut h = DefaultHasher::new();
+        for p in std::iter::once(src).chain(subs.iter().map(PathBuf::as_path)) {
+            p.hash(&mut h);
+            if let Ok(m) = std::fs::metadata(p) {
+                m.len().hash(&mut h);
+                m.modified().ok().hash(&mut h);
+            }
+        }
+        self.encoder.hash(&mut h);
+        let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        self.cache_dir.join(format!("{stem}.{:016x}.mp4", h.finish()))
+    }
+
+    pub fn state(&self, src: &Path, subs: &[PathBuf]) -> CacheState {
+        let file = self.cache_file(src, subs);
+        if file.is_file() {
+            return CacheState::Ready(file);
+        }
+        let jobs = self.jobs.lock().unwrap();
+        match &jobs.current {
+            Some((p, pct)) if p == src => CacheState::Converting(*pct),
+            _ if jobs.failed.contains(src) => CacheState::Failed,
+            _ => CacheState::Waiting,
+        }
+    }
+
+    /// Queue a conversion. `urgent` puts it first (someone wants to watch it).
+    pub fn enqueue(&self, src: PathBuf, subs: Vec<PathBuf>, urgent: bool) {
+        if self.cache_file(&src, &subs).is_file() {
+            return;
+        }
+        let mut jobs = self.jobs.lock().unwrap();
+        if jobs.failed.contains(&src) || jobs.current.as_ref().is_some_and(|(p, _)| *p == src) {
+            return;
+        }
+        let existing = jobs.queue.iter().position(|j| j.src == src);
+        match (existing, urgent) {
+            (Some(_), false) => return,
+            (Some(i), true) => {
+                jobs.queue.remove(i);
+            }
+            _ => {}
+        }
+        let job = Job { src, subs };
+        if urgent { jobs.queue.push_front(job) } else { jobs.queue.push_back(job) }
+        self.wake.notify_all();
+    }
+
+    /// Background thread converting queued videos one at a time.
+    pub fn start_worker(&'static self) {
+        std::thread::spawn(move || loop {
+            let job = {
+                let mut jobs = self.jobs.lock().unwrap();
+                loop {
+                    if let Some(j) = jobs.queue.pop_front() {
+                        jobs.current = Some((j.src.clone(), 0.0));
+                        break j;
+                    }
+                    jobs = self.wake.wait(jobs).unwrap();
+                }
+            };
+            let ok = self.convert(&job);
+            let mut jobs = self.jobs.lock().unwrap();
+            jobs.current = None;
+            if !ok {
+                jobs.failed.insert(job.src);
+            }
+        });
+    }
+
+    fn convert(&self, job: &Job) -> bool {
+        let name = job.src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let target = self.cache_file(&job.src, &job.subs);
+        if target.is_file() {
+            return true;
+        }
+        let part = target.with_extension("mp4.part");
+        let duration = self.probe(&job.src).and_then(|p| p.duration).unwrap_or(0.0);
+        println!(" Converting for TV: {name}");
+        let started = Instant::now();
+
+        let mut cmd = self.encode_cmd(&job.src, &job.subs);
+        cmd.args(["-movflags", "+faststart", "-progress", "pipe:1", "-nostats", "-y", "-f", "mp4"]).arg(&part);
+        // Below-normal priority, so a video being watched (streamed live)
+        // gets the CPU first.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+            cmd.creation_flags(BELOW_NORMAL_PRIORITY_CLASS);
+        }
+        let mut child = match cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                println!(" Conversion failed to start for {name}: {e}");
+                return false;
+            }
+        };
+        // Collect ffmpeg's error output on a side thread so it can't block.
+        let stderr = child.stderr.take();
+        let errors = std::thread::spawn(move || {
+            let mut s = String::new();
+            if let Some(mut e) = stderr {
+                let _ = e.read_to_string(&mut s);
+            }
+            s
+        });
+        let mut last_step = 0;
+        if let Some(out) = child.stdout.take() {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                let Some(us) = line.strip_prefix("out_time_us=").and_then(|v| v.trim().parse::<f64>().ok()) else {
+                    continue;
+                };
+                if duration <= 0.0 {
+                    continue;
+                }
+                let pct = (us / 1e6 / duration).clamp(0.0, 1.0) as f32;
+                if let Some((_, p)) = self.jobs.lock().unwrap().current.as_mut() {
+                    *p = pct;
+                }
+                let step = (pct * 10.0) as u32;
+                if step > last_step && step < 10 {
+                    last_step = step;
+                    println!(" Converting {name}: {}%", step * 10);
+                }
+            }
+        }
+        let status = child.wait();
+        let errors = errors.join().unwrap_or_default();
+        if status.is_ok_and(|s| s.success()) && std::fs::rename(&part, &target).is_ok() {
+            let mins = started.elapsed().as_secs_f64() / 60.0;
+            println!(" Ready for TV (seekable): {name} ({mins:.1} min)");
+            true
+        } else {
+            let _ = std::fs::remove_file(&part);
+            let reason = errors.lines().last().unwrap_or("ffmpeg stopped").trim().to_string();
+            println!(" Conversion failed for {name}: {reason}");
+            false
+        }
     }
 }
 

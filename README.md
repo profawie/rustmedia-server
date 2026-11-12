@@ -66,16 +66,31 @@ black screen. RustMedia can convert those videos to H.264 while streaming:
 3. Start `rustmedia.exe`. It prints `Transcoding: on`.
 
 RustMedia checks each video with ffprobe. Files that are already 8-bit
-H.264 are sent as-is (with seeking). The others are converted on the fly:
+H.264 are sent as-is. The others are **converted in the background**, one
+at a time, into a new MP4 in `.rustmedia-cache` inside the shared folder
+(or the temp folder if that one is read-only). The console shows progress:
 
-- video to H.264 (max 1080p), audio tracks to AAC stereo;
-- subtitles go inside the stream as tracks: text subtitles embedded in the
-  file plus `Movie.srt`, `Movie.ms.srt`, ... (named Malay, English, ...);
-- seeking (jumping ahead) is not possible in a transcoded video;
-- it uses the laptop's CPU. If it can't keep up, try a GPU encoder:
-  `--encoder h264_nvenc` (NVIDIA), `h264_qsv` (Intel) or `h264_amf` (AMD).
+```
+ Converting for TV: Movie.mkv
+ Converting Movie.mkv: 30%
+ Ready for TV (seekable): Movie.mkv (24.5 min)
+```
 
-In the playlist and file list, transcoded videos are marked `[TV]`.
+- Once a video is converted it plays from the MP4 and **seeking works**.
+- A video you open before it is converted moves to the front of the queue
+  and is streamed live meanwhile, without seeking. Its name shows
+  `(TV, converting 40%, no seeking yet)`; refresh the list in VLC later.
+- The MP4 has H.264 video (max 1080p), all audio tracks as AAC stereo, and
+  the subtitles as tracks: text subtitles embedded in the file plus
+  `Movie.srt`, `Movie.ms.srt`, ... (named Malay, English, ...).
+- Converted files are reused on the next start. They are made again if the
+  video or its subtitle files change. You can delete `.rustmedia-cache` at
+  any time to free space (a 2-hour 1080p film takes roughly 2-4 GB).
+- Converting uses the CPU (at low priority). To make it faster, try a GPU
+  encoder: `--encoder h264_nvenc` (NVIDIA), `h264_qsv` (Intel) or
+  `h264_amf` (AMD).
+
+In the playlist and file list, these videos are marked `[TV]`.
 
 ## Options
 
@@ -97,7 +112,8 @@ rustmedia.exe [FOLDER] [--port N] [--name NAME] [--no-dlna] [--no-transcode] [--
 - The laptop and TV must be on the same network. Some routers' "Guest Wi-Fi"
   or "AP isolation" stop devices from talking to each other.
 - Without ffmpeg, files are sent as-is and whether a video plays depends on
-  the TV's decoder (see Transcoding). Transcoded videos can't be seeked.
+  the TV's decoder (see Transcoding). A video can't be seeked until its
+  conversion has finished.
 - Picture-based subtitles (PGS, VobSub) are dropped from transcoded videos.
 - Intended for home networks only: there is no password, so anyone on the
   same Wi-Fi can see the shared folder.

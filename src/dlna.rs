@@ -13,6 +13,7 @@ use std::time::Duration;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use crate::http::{read_entries, respond, Ctx, Request};
+use crate::transcode::CacheState;
 use crate::util::*;
 
 pub const CONTENT_FEATURES: &str =
@@ -313,6 +314,14 @@ fn item_xml(ctx: &Ctx, rel: &str, name: &str, size: u64, subs: &[String], base: 
         _ => "object.item.videoItem",
     };
     let title = name.rsplit_once('.').map(|(t, _)| t).filter(|t| !t.is_empty()).unwrap_or(name);
+    let tc_state = ctx.tc_state(rel);
+    // Say in the title when a video can't be seeked yet.
+    let title = match &tc_state {
+        Some(st @ (CacheState::Converting(_) | CacheState::Waiting | CacheState::Failed)) => {
+            format!("{title} ({})", crate::http::tc_note(st))
+        }
+        _ => title.to_string(),
+    };
     // Subtitles. VLC turns every <res> with a text/* protocolInfo into a
     // subtitle track, so all of them are offered. Samsung TVs read
     // sec:CaptionInfoEx, which only holds one (the exact-name match).
@@ -338,7 +347,11 @@ fn item_xml(ctx: &Ctx, rel: &str, name: &str, size: u64, subs: &[String], base: 
             .unwrap_or_default(),
         _ => String::new(),
     };
-    let res_attrs = if transcoded {
+    let res_attrs = if let Some(CacheState::Ready(file)) = &tc_state {
+        // Converted MP4: a normal seekable file.
+        let size = fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+        format!("protocolInfo=\"http-get:*:video/mp4:{CONTENT_FEATURES}\" size=\"{size}\"{duration}")
+    } else if transcoded {
         format!("protocolInfo=\"http-get:*:video/mp4:{}\"{duration}", crate::transcode::TC_FEATURES)
     } else {
         format!("protocolInfo=\"http-get:*:{mime}:{CONTENT_FEATURES}\" size=\"{size}\"{duration}")
@@ -348,7 +361,7 @@ fn item_xml(ctx: &Ctx, rel: &str, name: &str, size: u64, subs: &[String], base: 
          {captions}<res {res_attrs}>{}</res>{sub_res}</item>",
         escape_xml(rel),
         escape_xml(&parent_id(rel)),
-        escape_xml(title),
+        escape_xml(&title),
         escape_xml(&format!("{base}{path}"))
     )
 }
