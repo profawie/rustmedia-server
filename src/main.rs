@@ -14,13 +14,15 @@ const HELP: &str = "\
 RustMedia - share a video folder with VLC over the local network (LAN)
 
 Usage: rustmedia.exe [FOLDER] [--port N] [--name NAME] [--no-dlna]
-                     [--no-transcode] [--encoder NAME]
+                     [--no-transcode] [--encoder NAME] [--sub-lang TAG]
 
   FOLDER       Folder to share (default: current directory)
   --port N     HTTP port (default: 8080; tries the next port if busy)
   --name NAME  Name shown in VLC > Local Network (UPnP)
   --no-dlna    Disable UPnP/DLNA discovery
   --no-transcode  Never transcode, always send files as-is
+  --sub-lang TAG  Subtitle shown first / on Samsung TVs, from Movie.TAG.srt
+                  (e.g. --sub-lang ms for Movie.ms.srt)
   --encoder NAME  ffmpeg H.264 encoder (default: libx264; GPU options:
                   h264_nvenc, h264_qsv, h264_amf)
 
@@ -37,10 +39,11 @@ struct Args {
     dlna: bool,
     transcode: bool,
     encoder: String,
+    sub_lang: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args { dir: None, port: None, name: None, dlna: true, transcode: true, encoder: "libx264".into() };
+    let mut a = Args { dir: None, port: None, name: None, dlna: true, transcode: true, encoder: "libx264".into(), sub_lang: None };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -56,6 +59,7 @@ fn parse_args() -> Result<Args, String> {
             "--no-dlna" => a.dlna = false,
             "--no-transcode" => a.transcode = false,
             "--encoder" => a.encoder = it.next().ok_or("--encoder needs a value")?,
+            "--sub-lang" => a.sub_lang = Some(it.next().ok_or("--sub-lang needs a value, e.g. ms")?),
             s if s.starts_with('-') => return Err(format!("unknown option: {s}\n\n{HELP}")),
             s => a.dir = Some(PathBuf::from(s)),
         }
@@ -148,6 +152,7 @@ fn main() {
         root: root.clone(),
         dlna: device,
         tc,
+        sub_lang: args.sub_lang.clone(),
     });
 
     if let Some(tc) = tc {

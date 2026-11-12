@@ -54,6 +54,26 @@ Movie.srt        (or Movie.en.srt, Movie.ms.srt; .srt, .vtt, .ass and .ssa work)
   For other videos use Option B, subtitles embedded in the file, or on the
   laptop Subtitle > Add Subtitle File.
 
+## Samsung TVs and Smart Monitors (no VLC)
+
+Samsung Tizen TVs and Smart Monitors (e.g. M7) have a built-in DLNA player:
+
+1. Start `rustmedia.exe` on the laptop (same Wi-Fi as the monitor).
+2. On the monitor: **Source** (or Home > **Connected Devices**), choose
+   **RustMedia - <folder> (<PC>)**, browse to the video and play it.
+
+Samsung players decode HEVC, MKV and 10-bit video themselves, so they get
+the original files (no conversion, seeking works). They show **one**
+subtitle file, sent with Samsung's `CaptionInfo.sec` extension. To choose
+which one, start with `--sub-lang`:
+
+```
+rustmedia.exe --sub-lang ms      # prefer Movie.ms.srt over Movie.srt
+```
+
+If you only watch on a Samsung, `--no-transcode` saves the laptop from
+converting videos in the background.
+
 ## Transcoding (HEVC / x265 videos on TVs)
 
 Many TVs can't decode HEVC (x265), 10-bit, VP9 or AV1 video, so VLC shows a
@@ -95,7 +115,7 @@ In the playlist and file list, these videos are marked `[TV]`.
 ## Options
 
 ```
-rustmedia.exe [FOLDER] [--port N] [--name NAME] [--no-dlna] [--no-transcode] [--encoder NAME]
+rustmedia.exe [FOLDER] [--port N] [--name NAME] [--no-dlna] [--no-transcode] [--encoder NAME] [--sub-lang TAG]
 ```
 
 | Option | Meaning |
@@ -106,6 +126,7 @@ rustmedia.exe [FOLDER] [--port N] [--name NAME] [--no-dlna] [--no-transcode] [--
 | `--no-dlna` | Disable UPnP/DLNA discovery |
 | `--no-transcode` | Never transcode, always send files as-is |
 | `--encoder NAME` | ffmpeg H.264 encoder (default `libx264`) |
+| `--sub-lang TAG` | Subtitle listed first / used by Samsung (`ms` = `Movie.ms.srt`) |
 
 ## Limitations
 
