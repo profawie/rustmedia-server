@@ -254,6 +254,8 @@ pub struct Entry {
     pub rel: String,
     pub is_dir: bool,
     pub size: u64,
+    /// Relative paths of matching subtitle files (`Movie.srt`, `Movie.en.srt`, ...).
+    pub subs: Vec<String>,
 }
 
 /// Visible children of a directory, folders first, naturally sorted.
@@ -269,13 +271,46 @@ pub fn read_entries(dir: &Path, rel: &str) -> Vec<Entry> {
                 // fs::metadata follows symlinks, so linked folders work.
                 let meta = fs::metadata(e.path()).ok()?;
                 let rel = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
-                Some(Entry { name, rel, is_dir: meta.is_dir(), size: meta.len() })
+                Some(Entry { name, rel, is_dir: meta.is_dir(), size: meta.len(), subs: Vec::new() })
             })
             .collect(),
         Err(_) => Vec::new(),
     };
     v.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| natural_cmp(&a.name, &b.name)));
+    attach_subtitles(&mut v);
     v
+}
+
+/// For every video, find sibling subtitle files sharing its base name:
+/// `Movie.mkv` matches `Movie.srt`, `Movie.en.srt`, `Movie.Malay.ass`.
+/// An exact-name match comes first.
+fn attach_subtitles(entries: &mut [Entry]) {
+    let subs: Vec<(String, String)> = entries
+        .iter()
+        .filter(|e| !e.is_dir && is_subtitle(&e.name))
+        .map(|e| (e.name.to_lowercase(), e.rel.clone()))
+        .collect();
+    if subs.is_empty() {
+        return;
+    }
+    for e in entries.iter_mut().filter(|e| !e.is_dir && mime_for(&e.name).1 == Kind::Video) {
+        let stem = e.name.rsplit_once('.').map(|(s, _)| s).unwrap_or(&e.name).to_lowercase();
+        let mut found: Vec<(bool, &String)> = subs
+            .iter()
+            .filter_map(|(lname, rel)| {
+                let sub_stem = lname.rsplit_once('.').map(|(s, _)| s)?;
+                if sub_stem == stem {
+                    Some((true, rel))
+                } else if sub_stem.strip_prefix(&stem)?.starts_with('.') {
+                    Some((false, rel))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        found.sort_by_key(|(exact, _)| !exact);
+        e.subs = found.into_iter().map(|(_, r)| r.clone()).collect();
+    }
 }
 
 /// Recursively collect playable files (video/audio) under `dir`.
@@ -299,7 +334,8 @@ fn playlist(dir: &Path, rel: &str, base: &str) -> String {
     let mut s = String::from("#EXTM3U\n");
     for f in files {
         let title = f.rel.replace('/', " / ");
-        s.push_str(&format!("#EXTINF:-1,{title}\n{base}/{}\n", url_encode_path(&f.rel)));
+        s.push_str(&format!("#EXTINF:-1,{title}\n"));
+        s.push_str(&format!("{base}/{}\n", url_encode_path(&f.rel)));
     }
     s
 }
@@ -353,8 +389,8 @@ ul{{padding:0}} small{{color:#999}} .d a{{color:#fc6;font-weight:600}} .m a{{col
 .u{{display:block;color:#777;font-size:12px;font-family:monospace}}
 .box{{background:#222;padding:12px;border-radius:8px;font-size:14px}} code{{color:#9f9;word-break:break-all}}
 </style></head><body><h2>RustMedia {t}</h2>
-<div class=box>VLC &rarr; Media &rarr; Open Network Stream, tampal URL ini untuk senarai main (playlist) folder ini:<br><code>{pl}</code><br>
-<a href="{pl_href}">Muat turun playlist.m3u</a></div>
+<div class=box>VLC &rarr; Media &rarr; Open Network Stream, paste this URL to play this folder as a playlist:<br><code>{pl}</code><br>
+<a href="{pl_href}">Download playlist.m3u</a></div>
 <ul>
 {rows}</ul></body></html>"#,
         t = escape_xml(&title),

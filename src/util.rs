@@ -117,7 +117,7 @@ pub fn mime_for(name: &str) -> (&'static str, Kind) {
         "gif" => ("image/gif", Image),
         "webp" => ("image/webp", Image),
         "bmp" => ("image/bmp", Image),
-        "srt" => ("application/x-subrip", Subtitle),
+        "srt" => ("text/srt", Subtitle),
         "vtt" => ("text/vtt", Subtitle),
         "ass" | "ssa" => ("text/x-ssa", Subtitle),
         "sub" => ("text/plain", Subtitle),
@@ -126,6 +126,11 @@ pub fn mime_for(name: &str) -> (&'static str, Kind) {
         "pdf" => ("application/pdf", Other),
         _ => ("application/octet-stream", Other),
     }
+}
+
+pub fn is_subtitle(name: &str) -> bool {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    matches!(ext.as_str(), "srt" | "vtt" | "ass" | "ssa")
 }
 
 pub fn is_playable(name: &str) -> bool {

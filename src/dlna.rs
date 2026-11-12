@@ -86,7 +86,7 @@ pub fn start_ssdp(dev: &'static Device, ip: Ipv4Addr, port: u16) -> Option<Strin
             std::thread::spawn(move || listen(sock, dev, &location));
         }
         Err(e) => {
-            warning = Some(format!("SSDP port 1900 tidak dapat dibuka ({e}); hanya pengumuman (NOTIFY) dihantar."))
+            warning = Some(format!("could not open SSDP port 1900 ({e}); sending announcements (NOTIFY) only."))
         }
     }
 
@@ -278,7 +278,7 @@ fn soap(action: &str, inner: &str) -> String {
     )
 }
 
-const DIDL_OPEN: &str = r#"<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/">"#;
+const DIDL_OPEN: &str = r#"<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/" xmlns:sec="http://www.sec.co.kr/">"#;
 
 fn parent_id(rel: &str) -> String {
     match rel.rsplit_once('/') {
@@ -305,7 +305,7 @@ fn container_xml(ctx: &Ctx, rel: &str, title: &str) -> String {
     )
 }
 
-fn item_xml(rel: &str, name: &str, size: u64, base: &str) -> String {
+fn item_xml(rel: &str, name: &str, size: u64, subs: &[String], base: &str) -> String {
     let (mime, kind) = mime_for(name);
     let class = match kind {
         Kind::Audio => "object.item.audioItem.musicTrack",
@@ -313,9 +313,22 @@ fn item_xml(rel: &str, name: &str, size: u64, base: &str) -> String {
         _ => "object.item.videoItem",
     };
     let title = name.rsplit_once('.').map(|(t, _)| t).filter(|t| !t.is_empty()).unwrap_or(name);
+    // Subtitles. VLC turns every <res> with a text/* protocolInfo into a
+    // subtitle track, so all of them are offered. Samsung TVs read
+    // sec:CaptionInfoEx, which only holds one (the exact-name match).
+    let mut captions = String::new();
+    let mut sub_res = String::new();
+    for (i, sub) in subs.iter().enumerate() {
+        let ext = sub.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+        let url = escape_xml(&format!("{base}/{}", url_encode_path(sub)));
+        if i == 0 {
+            captions = format!("<sec:CaptionInfoEx sec:type=\"{ext}\">{url}</sec:CaptionInfoEx>");
+        }
+        sub_res.push_str(&format!("<res protocolInfo=\"http-get:*:text/{ext}:*\">{url}</res>"));
+    }
     format!(
         "<item id=\"{}\" parentID=\"{}\" restricted=\"1\"><dc:title>{}</dc:title><upnp:class>{class}</upnp:class>\
-         <res protocolInfo=\"http-get:*:{mime}:{CONTENT_FEATURES}\" size=\"{size}\">{}</res></item>",
+         {captions}<res protocolInfo=\"http-get:*:{mime}:{CONTENT_FEATURES}\" size=\"{size}\">{}</res>{sub_res}</item>",
         escape_xml(rel),
         escape_xml(&parent_id(rel)),
         escape_xml(title),
@@ -335,7 +348,14 @@ fn browse(ctx: &Ctx, id: &str, metadata: bool, start: usize, count: usize, base:
             let title = if rel.is_empty() { "RustMedia".to_string() } else { name };
             didl.push_str(&container_xml(ctx, &rel, &title));
         } else {
-            didl.push_str(&item_xml(&rel, &name, meta.len(), base));
+            let parent = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+            let parent_dir = full.parent().unwrap_or(&ctx.root);
+            let subs = read_entries(parent_dir, parent)
+                .into_iter()
+                .find(|e| e.rel == rel)
+                .map(|e| e.subs)
+                .unwrap_or_default();
+            didl.push_str(&item_xml(&rel, &name, meta.len(), &subs, base));
         }
         didl.push_str("</DIDL-Lite>");
         return Some((didl, 1, 1));
@@ -352,7 +372,7 @@ fn browse(ctx: &Ctx, id: &str, metadata: bool, start: usize, count: usize, base:
         if e.is_dir {
             didl.push_str(&container_xml(ctx, &e.rel, &e.name));
         } else {
-            didl.push_str(&item_xml(&e.rel, &e.name, e.size, base));
+            didl.push_str(&item_xml(&e.rel, &e.name, e.size, &e.subs, base));
         }
         returned += 1;
     }
