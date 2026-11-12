@@ -9,11 +9,26 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::dlna;
+use crate::transcode::Transcoder;
 use crate::util::*;
 
 pub struct Ctx {
     pub root: PathBuf,
     pub dlna: Option<&'static dlna::Device>,
+    pub tc: Option<&'static Transcoder>,
+}
+
+impl Ctx {
+    /// URL path a client should use to play `rel`: the original file, or
+    /// `/_tc/...` when it has to be transcoded for the TV.
+    pub fn play_path(&self, rel: &str) -> (String, bool) {
+        let needs_tc = self.tc.is_some_and(|tc| {
+            mime_for(rel).1 == Kind::Video
+                && safe_join(&self.root, rel).is_some_and(|(full, _)| tc.needs_transcode(&full))
+        });
+        let p = url_encode_path(rel);
+        if needs_tc { (format!("/_tc/{p}"), true) } else { (format!("/{p}"), false) }
+    }
 }
 
 pub struct Request {
@@ -139,13 +154,38 @@ fn handle(ctx: &Ctx, mut stream: TcpStream) -> io::Result<()> {
         return respond(&mut stream, "405 Method Not Allowed", &[("Allow", "GET, HEAD")], b"", false);
     }
 
+    if let Some(rest) = req.path.strip_prefix("/_tc/") {
+        let Some(tc) = ctx.tc else {
+            return respond(&mut stream, "404 Not Found", &[], b"transcoding disabled", head);
+        };
+        let Some((full, _)) = safe_join(&ctx.root, &percent_decode(rest, false)) else {
+            return respond(&mut stream, "400 Bad Request", &[], b"bad path", head);
+        };
+        if !full.is_file() {
+            return respond(&mut stream, "404 Not Found", &[], b"Not found", head);
+        }
+        // Sibling subtitle files are muxed into the stream as tracks.
+        let rel = percent_decode(rest, false);
+        let parent = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        let subs: Vec<PathBuf> = full
+            .parent()
+            .map(|dir| read_entries(dir, parent))
+            .unwrap_or_default()
+            .into_iter()
+            .find(|e| e.rel == rel.trim_matches('/'))
+            .map(|e| e.subs.iter().filter_map(|s| safe_join(&ctx.root, s).map(|(p, _)| p)).collect())
+            .unwrap_or_default();
+        stream.set_read_timeout(None)?;
+        return tc.stream(&mut stream, &full, &subs, head);
+    }
+
     if req.path == "/playlist.m3u" || req.path == "/playlist.m3u8" {
         let dir = req.query_param("dir").unwrap_or_default();
         let Some((full, rel)) = safe_join(&ctx.root, &dir) else {
             return respond(&mut stream, "400 Bad Request", &[], b"bad path", head);
         };
         let base = base_url(&req, local);
-        let body = playlist(&full, &rel, &base);
+        let body = playlist(ctx, &full, &rel, &base);
         return respond(
             &mut stream,
             "200 OK",
@@ -168,7 +208,7 @@ fn handle(ctx: &Ctx, mut stream: TcpStream) -> io::Result<()> {
             let loc = format!("{}/", req.path);
             return respond(&mut stream, "301 Moved Permanently", &[("Location", &loc)], b"", head);
         }
-        let html = listing(&full, &rel, &base_url(&req, local));
+        let html = listing(ctx, &full, &rel, &base_url(&req, local));
         return respond(
             &mut stream,
             "200 OK",
@@ -327,15 +367,16 @@ pub fn walk_media(dir: &Path, rel: &str, out: &mut Vec<Entry>, depth: usize) {
     }
 }
 
-fn playlist(dir: &Path, rel: &str, base: &str) -> String {
+fn playlist(ctx: &Ctx, dir: &Path, rel: &str, base: &str) -> String {
     let mut files = Vec::new();
     walk_media(dir, rel, &mut files, 0);
     files.sort_by(|a, b| natural_cmp(&a.rel, &b.rel));
     let mut s = String::from("#EXTM3U\n");
     for f in files {
         let title = f.rel.replace('/', " / ");
-        s.push_str(&format!("#EXTINF:-1,{title}\n"));
-        s.push_str(&format!("{base}/{}\n", url_encode_path(&f.rel)));
+        let (path, tc) = ctx.play_path(&f.rel);
+        let title = if tc { format!("{title} [TV]") } else { title };
+        s.push_str(&format!("#EXTINF:-1,{title}\n{base}{path}\n"));
     }
     s
 }
@@ -351,7 +392,7 @@ fn human_size(n: u64) -> String {
     if i == 0 { format!("{n} B") } else { format!("{v:.1} {}", units[i]) }
 }
 
-fn listing(dir: &Path, rel: &str, base: &str) -> String {
+fn listing(ctx: &Ctx, dir: &Path, rel: &str, base: &str) -> String {
     let title = if rel.is_empty() { "/".to_string() } else { format!("/{rel}/") };
     let pl = if rel.is_empty() {
         format!("{base}/playlist.m3u")
@@ -371,7 +412,9 @@ fn listing(dir: &Path, rel: &str, base: &str) -> String {
             (c, escape_xml(&e.name), human_size(e.size))
         };
         let copy = if !e.is_dir && is_playable(&e.name) {
-            format!(" <span class=u>{}{}</span>", escape_xml(base), escape_xml(&href))
+            let (path, tc) = ctx.play_path(&e.rel);
+            let tag = if tc { " (transcoded for TV)" } else { "" };
+            format!(" <span class=u>{}{}{tag}</span>", escape_xml(base), escape_xml(&path))
         } else {
             String::new()
         };

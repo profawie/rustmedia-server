@@ -48,14 +48,39 @@ Movie.srt        (or Movie.en.srt, Movie.ms.srt; .srt, .vtt, .ass and .ssa work)
 - **Option B (UPnP / Local Network):** the subtitle is attached to the video
   automatically. Every matching file becomes a track (e.g. `Movie.srt` and
   `Movie.ms.srt`); pick the one you want in VLC under Subtitle > Sub Track.
-- **Option A (playlist URL):** VLC does not accept subtitle files from a
-  playlist over the network, so use Option B, use subtitles embedded in the
-  file (e.g. MKV), or on the laptop use Subtitle > Add Subtitle File.
+- **Option A (playlist URL):** VLC does not accept separate subtitle files
+  from a playlist over the network. Videos that are transcoded (see below)
+  carry their subtitles inside the stream, so they work with both options.
+  For other videos use Option B, subtitles embedded in the file, or on the
+  laptop Subtitle > Add Subtitle File.
+
+## Transcoding (HEVC / x265 videos on TVs)
+
+Many TVs can't decode HEVC (x265), 10-bit, VP9 or AV1 video, so VLC shows a
+black screen. RustMedia can convert those videos to H.264 while streaming:
+
+1. Download ffmpeg for Windows, e.g. the "release essentials" zip from
+   https://www.gyan.dev/ffmpeg/builds/ (or `winget install Gyan.FFmpeg`).
+2. Copy `ffmpeg.exe` and `ffprobe.exe` from its `bin` folder next to
+   `rustmedia.exe` (or have them on PATH).
+3. Start `rustmedia.exe`. It prints `Transcoding: on`.
+
+RustMedia checks each video with ffprobe. Files that are already 8-bit
+H.264 are sent as-is (with seeking). The others are converted on the fly:
+
+- video to H.264 (max 1080p), audio tracks to AAC stereo;
+- subtitles go inside the stream as tracks: text subtitles embedded in the
+  file plus `Movie.srt`, `Movie.ms.srt`, ... (named Malay, English, ...);
+- seeking (jumping ahead) is not possible in a transcoded video;
+- it uses the laptop's CPU. If it can't keep up, try a GPU encoder:
+  `--encoder h264_nvenc` (NVIDIA), `h264_qsv` (Intel) or `h264_amf` (AMD).
+
+In the playlist and file list, transcoded videos are marked `[TV]`.
 
 ## Options
 
 ```
-rustmedia.exe [FOLDER] [--port N] [--name NAME] [--no-dlna]
+rustmedia.exe [FOLDER] [--port N] [--name NAME] [--no-dlna] [--no-transcode] [--encoder NAME]
 ```
 
 | Option | Meaning |
@@ -64,15 +89,16 @@ rustmedia.exe [FOLDER] [--port N] [--name NAME] [--no-dlna]
 | `--port N` | HTTP port (default 8080, tries 8081.. if busy) |
 | `--name NAME` | Name shown in VLC > Local Network |
 | `--no-dlna` | Disable UPnP/DLNA discovery |
+| `--no-transcode` | Never transcode, always send files as-is |
+| `--encoder NAME` | ffmpeg H.264 encoder (default `libx264`) |
 
 ## Limitations
 
 - The laptop and TV must be on the same network. Some routers' "Guest Wi-Fi"
   or "AP isolation" stop devices from talking to each other.
-- No transcoding: files are sent as-is. Whether a video plays depends on VLC
-  on the TV (VLC supports almost every format, but heavy 4K/HEVC video may
-  stutter on old TVs or weak Wi-Fi).
-- Separate subtitle files only work through Option B (UPnP); see below.
+- Without ffmpeg, files are sent as-is and whether a video plays depends on
+  the TV's decoder (see Transcoding). Transcoded videos can't be seeked.
+- Picture-based subtitles (PGS, VobSub) are dropped from transcoded videos.
 - Intended for home networks only: there is no password, so anyone on the
   same Wi-Fi can see the shared folder.
 - Don't let the laptop sleep while watching.

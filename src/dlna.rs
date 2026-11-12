@@ -305,7 +305,7 @@ fn container_xml(ctx: &Ctx, rel: &str, title: &str) -> String {
     )
 }
 
-fn item_xml(rel: &str, name: &str, size: u64, subs: &[String], base: &str) -> String {
+fn item_xml(ctx: &Ctx, rel: &str, name: &str, size: u64, subs: &[String], base: &str) -> String {
     let (mime, kind) = mime_for(name);
     let class = match kind {
         Kind::Audio => "object.item.audioItem.musicTrack",
@@ -316,6 +316,9 @@ fn item_xml(rel: &str, name: &str, size: u64, subs: &[String], base: &str) -> St
     // Subtitles. VLC turns every <res> with a text/* protocolInfo into a
     // subtitle track, so all of them are offered. Samsung TVs read
     // sec:CaptionInfoEx, which only holds one (the exact-name match).
+    let (path, transcoded) = ctx.play_path(rel);
+    // A transcoded stream already carries its subtitles as tracks.
+    let subs = if transcoded { &[][..] } else { subs };
     let mut captions = String::new();
     let mut sub_res = String::new();
     for (i, sub) in subs.iter().enumerate() {
@@ -326,13 +329,27 @@ fn item_xml(rel: &str, name: &str, size: u64, subs: &[String], base: &str) -> St
         }
         sub_res.push_str(&format!("<res protocolInfo=\"http-get:*:text/{ext}:*\">{url}</res>"));
     }
+    // Videos the TV can't decode point at the transcoding endpoint instead.
+    let duration = match (kind, ctx.tc) {
+        (Kind::Video, Some(tc)) => safe_join(&ctx.root, rel)
+            .and_then(|(full, _)| tc.probe(&full))
+            .and_then(|p| p.duration)
+            .map(|d| format!(" duration=\"{}\"", crate::transcode::fmt_duration(d)))
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    let res_attrs = if transcoded {
+        format!("protocolInfo=\"http-get:*:video/mp4:{}\"{duration}", crate::transcode::TC_FEATURES)
+    } else {
+        format!("protocolInfo=\"http-get:*:{mime}:{CONTENT_FEATURES}\" size=\"{size}\"{duration}")
+    };
     format!(
         "<item id=\"{}\" parentID=\"{}\" restricted=\"1\"><dc:title>{}</dc:title><upnp:class>{class}</upnp:class>\
-         {captions}<res protocolInfo=\"http-get:*:{mime}:{CONTENT_FEATURES}\" size=\"{size}\">{}</res>{sub_res}</item>",
+         {captions}<res {res_attrs}>{}</res>{sub_res}</item>",
         escape_xml(rel),
         escape_xml(&parent_id(rel)),
         escape_xml(title),
-        escape_xml(&format!("{base}/{}", url_encode_path(rel)))
+        escape_xml(&format!("{base}{path}"))
     )
 }
 
@@ -355,7 +372,7 @@ fn browse(ctx: &Ctx, id: &str, metadata: bool, start: usize, count: usize, base:
                 .find(|e| e.rel == rel)
                 .map(|e| e.subs)
                 .unwrap_or_default();
-            didl.push_str(&item_xml(&rel, &name, meta.len(), &subs, base));
+            didl.push_str(&item_xml(ctx, &rel, &name, meta.len(), &subs, base));
         }
         didl.push_str("</DIDL-Lite>");
         return Some((didl, 1, 1));
@@ -372,7 +389,7 @@ fn browse(ctx: &Ctx, id: &str, metadata: bool, start: usize, count: usize, base:
         if e.is_dir {
             didl.push_str(&container_xml(ctx, &e.rel, &e.name));
         } else {
-            didl.push_str(&item_xml(&e.rel, &e.name, e.size, &e.subs, base));
+            didl.push_str(&item_xml(ctx, &e.rel, &e.name, e.size, &e.subs, base));
         }
         returned += 1;
     }

@@ -3,6 +3,7 @@
 
 mod dlna;
 mod http;
+mod transcode;
 mod util;
 
 use std::net::TcpListener;
@@ -13,11 +14,19 @@ const HELP: &str = "\
 RustMedia - share a video folder with VLC over the local network (LAN)
 
 Usage: rustmedia.exe [FOLDER] [--port N] [--name NAME] [--no-dlna]
+                     [--no-transcode] [--encoder NAME]
 
   FOLDER       Folder to share (default: current directory)
   --port N     HTTP port (default: 8080; tries the next port if busy)
   --name NAME  Name shown in VLC > Local Network (UPnP)
   --no-dlna    Disable UPnP/DLNA discovery
+  --no-transcode  Never transcode, always send files as-is
+  --encoder NAME  ffmpeg H.264 encoder (default: libx264; GPU options:
+                  h264_nvenc, h264_qsv, h264_amf)
+
+Transcoding: put ffmpeg.exe and ffprobe.exe next to rustmedia.exe (or on
+PATH). Videos a TV can't decode (HEVC/x265, 10-bit, VP9, AV1) are then
+converted to H.264 while streaming. Other files are sent as-is.
   -h, --help   Show this help
 ";
 
@@ -26,10 +35,12 @@ struct Args {
     port: Option<u16>,
     name: Option<String>,
     dlna: bool,
+    transcode: bool,
+    encoder: String,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args { dir: None, port: None, name: None, dlna: true };
+    let mut a = Args { dir: None, port: None, name: None, dlna: true, transcode: true, encoder: "libx264".into() };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -43,6 +54,8 @@ fn parse_args() -> Result<Args, String> {
             }
             "--name" => a.name = Some(it.next().ok_or("--name needs a value")?),
             "--no-dlna" => a.dlna = false,
+            "--no-transcode" => a.transcode = false,
+            "--encoder" => a.encoder = it.next().ok_or("--encoder needs a value")?,
             s if s.starts_with('-') => return Err(format!("unknown option: {s}\n\n{HELP}")),
             s => a.dir = Some(PathBuf::from(s)),
         }
@@ -106,9 +119,29 @@ fn main() {
         None
     };
 
+    let tc: Option<&'static transcode::Transcoder> = if args.transcode {
+        transcode::Transcoder::detect(args.encoder.clone()).map(|t| &*Box::leak(Box::new(t)))
+    } else {
+        None
+    };
+    if let Some(tc) = tc {
+        // Probe every video in the background so browsing is fast later.
+        let files: Vec<PathBuf> = media
+            .iter()
+            .filter(|e| util::mime_for(&e.name).1 == util::Kind::Video)
+            .filter_map(|e| util::safe_join(&root, &e.rel).map(|(p, _)| p))
+            .collect();
+        std::thread::spawn(move || {
+            for f in files {
+                tc.probe(&f);
+            }
+        });
+    }
+
     let ctx = Arc::new(http::Ctx {
         root: root.clone(),
         dlna: device,
+        tc,
     });
 
     println!("============================================================");
@@ -136,6 +169,19 @@ fn main() {
         }
         println!();
     }
+    match tc {
+        Some(t) => {
+            println!(" Transcoding: on ({}, encoder {}).", t.ffmpeg_path().display(), t.encoder());
+            println!("   HEVC/x265, 10-bit, VP9 and AV1 videos are converted to H.264.");
+            println!("   Seeking is not available while a video is transcoded.");
+        }
+        None if args.transcode => {
+            println!(" Transcoding: off (ffmpeg.exe + ffprobe.exe not found next to");
+            println!("   rustmedia.exe or on PATH). HEVC videos may not play on TVs.");
+        }
+        None => println!(" Transcoding: off (--no-transcode)."),
+    }
+    println!();
     if ip.is_loopback() {
         println!(" WARNING: no network detected. Connect to Wi-Fi first.");
     }
