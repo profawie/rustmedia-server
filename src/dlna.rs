@@ -181,7 +181,7 @@ pub fn handle_http(
                 .unwrap_or_default();
             let body = String::from_utf8_lossy(&req.body);
             let base = format!("http://{local}");
-            match control(ctx, &action, &body, &base) {
+            match control(ctx, &action, &body, &base, crate::http::is_samsung(req)) {
                 Some(resp) => respond(stream, "200 OK", &xml, soap(&action, &resp).as_bytes(), false),
                 None => respond(stream, "500 Internal Server Error", &xml, SOAP_FAULT.as_bytes(), false),
             }
@@ -206,11 +206,13 @@ fn description(dev: &Device) -> String {
     };
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
-<root xmlns="urn:schemas-upnp-org:device-1-0" xmlns:dlna="urn:schemas-dlna-org:device-1-0">
+<root xmlns="urn:schemas-upnp-org:device-1-0" xmlns:dlna="urn:schemas-dlna-org:device-1-0" xmlns:sec="http://www.sec.co.kr/dlna">
 <specVersion><major>1</major><minor>0</minor></specVersion>
 <device><deviceType>{DEVICE_TYPE}</deviceType><friendlyName>{name}</friendlyName>
 <manufacturer>RustMedia</manufacturer><modelName>RustMedia Server</modelName><modelNumber>{ver}</modelNumber>
 <dlna:X_DLNADOC>DMS-1.50</dlna:X_DLNADOC><UDN>uuid:{uuid}</UDN>
+<sec:ProductCap>smi,DCM10,getMediaInfo.sec,getCaptionInfo.sec</sec:ProductCap>
+<sec:X_ProductCap>smi,DCM10,getMediaInfo.sec,getCaptionInfo.sec</sec:X_ProductCap>
 <serviceList>{cds}{cms}</serviceList></device></root>"#,
         name = escape_xml(&dev.name),
         ver = env!("CARGO_PKG_VERSION"),
@@ -243,14 +245,14 @@ fn xml_arg(body: &str, name: &str) -> Option<String> {
 }
 
 /// Returns the inner response arguments (XML) for a SOAP action.
-fn control(ctx: &Ctx, action: &str, body: &str, base: &str) -> Option<String> {
+fn control(ctx: &Ctx, action: &str, body: &str, base: &str, native: bool) -> Option<String> {
     match action {
         "Browse" => {
             let id = xml_arg(body, "ObjectID").unwrap_or_else(|| "0".into());
             let flag = xml_arg(body, "BrowseFlag").unwrap_or_default();
             let start: usize = xml_arg(body, "StartingIndex").and_then(|v| v.parse().ok()).unwrap_or(0);
             let count: usize = xml_arg(body, "RequestedCount").and_then(|v| v.parse().ok()).unwrap_or(0);
-            let (didl, returned, total) = browse(ctx, &id, flag == "BrowseMetadata", start, count, base)?;
+            let (didl, returned, total) = browse(ctx, &id, flag == "BrowseMetadata", start, count, base, native)?;
             Some(format!(
                 "<Result>{}</Result><NumberReturned>{returned}</NumberReturned>\
                  <TotalMatches>{total}</TotalMatches><UpdateID>1</UpdateID>",
@@ -258,6 +260,13 @@ fn control(ctx: &Ctx, action: &str, body: &str, base: &str) -> Option<String> {
             ))
         }
         "GetSystemUpdateID" => Some("<Id>1</Id>".into()),
+        // Samsung extension: which containers to open for video/audio/photo.
+        "X_GetFeatureList" => Some(format!(
+            "<FeatureList>{}</FeatureList>",
+            escape_xml(
+                r#"<?xml version="1.0" encoding="UTF-8"?><Features xmlns="urn:schemas-upnp-org:av:avs" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:schemas-upnp-org:av:avs http://www.upnp.org/schemas/av/avs.xsd"><Feature name="samsung.com_BASICVIEW" version="1"><container id="0" type="object.item.audioItem"/><container id="0" type="object.item.videoItem"/><container id="0" type="object.item.imageItem"/></Feature></Features>"#
+            )
+        )),
         "GetSearchCapabilities" => Some("<SearchCaps></SearchCaps>".into()),
         "GetSortCapabilities" => Some("<SortCaps></SortCaps>".into()),
         "GetProtocolInfo" => Some(
@@ -306,7 +315,13 @@ fn container_xml(ctx: &Ctx, rel: &str, title: &str) -> String {
     )
 }
 
-fn item_xml(ctx: &Ctx, rel: &str, name: &str, size: u64, subs: &[String], base: &str) -> String {
+/// Samsung players expect `video/x-mkv` rather than `video/x-matroska`.
+pub fn samsung_mime(mime: &'static str) -> &'static str {
+    if mime == "video/x-matroska" { "video/x-mkv" } else { mime }
+}
+
+/// `native`: the client plays the original files (Samsung), so no transcoding.
+fn item_xml(ctx: &Ctx, rel: &str, name: &str, size: u64, subs: &[String], base: &str, native: bool) -> String {
     let (mime, kind) = mime_for(name);
     let class = match kind {
         Kind::Audio => "object.item.audioItem.musicTrack",
@@ -314,7 +329,7 @@ fn item_xml(ctx: &Ctx, rel: &str, name: &str, size: u64, subs: &[String], base: 
         _ => "object.item.videoItem",
     };
     let title = name.rsplit_once('.').map(|(t, _)| t).filter(|t| !t.is_empty()).unwrap_or(name);
-    let tc_state = ctx.tc_state(rel);
+    let tc_state = if native { None } else { ctx.tc_state(rel) };
     // Say in the title when a video can't be seeked yet.
     let title = match &tc_state {
         Some(st @ (CacheState::Converting(_) | CacheState::Waiting | CacheState::Failed)) => {
@@ -325,18 +340,24 @@ fn item_xml(ctx: &Ctx, rel: &str, name: &str, size: u64, subs: &[String], base: 
     // Subtitles. VLC turns every <res> with a text/* protocolInfo into a
     // subtitle track, so all of them are offered. Samsung TVs read
     // sec:CaptionInfoEx, which only holds one (the exact-name match).
-    let (path, transcoded) = ctx.play_path(rel);
+    let (path, transcoded) = if native { (format!("/{}", url_encode_path(rel)), false) } else { ctx.play_path(rel) };
     // A transcoded stream already carries its subtitles as tracks.
-    let subs = if transcoded { &[][..] } else { subs };
+    let subs = if transcoded { Vec::new() } else { crate::http::order_subs(subs, name, ctx.sub_lang.as_deref()) };
     let mut captions = String::new();
     let mut sub_res = String::new();
     for (i, sub) in subs.iter().enumerate() {
         let ext = sub.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
         let url = escape_xml(&format!("{base}/{}", url_encode_path(sub)));
         if i == 0 {
-            captions = format!("<sec:CaptionInfoEx sec:type=\"{ext}\">{url}</sec:CaptionInfoEx>");
+            captions = format!(
+                "<sec:CaptionInfo sec:type=\"{ext}\">{url}</sec:CaptionInfo><sec:CaptionInfoEx sec:type=\"{ext}\">{url}</sec:CaptionInfoEx>"
+            );
         }
-        sub_res.push_str(&format!("<res protocolInfo=\"http-get:*:text/{ext}:*\">{url}</res>"));
+        // Samsung reads sec:CaptionInfo and could mistake extra <res> for
+        // alternative video versions, so those are for other clients only.
+        if !native {
+            sub_res.push_str(&format!("<res protocolInfo=\"http-get:*:text/{ext}:*\">{url}</res>"));
+        }
     }
     // Videos the TV can't decode point at the transcoding endpoint instead.
     let duration = match (kind, ctx.tc) {
@@ -354,6 +375,7 @@ fn item_xml(ctx: &Ctx, rel: &str, name: &str, size: u64, subs: &[String], base: 
     } else if transcoded {
         format!("protocolInfo=\"http-get:*:video/mp4:{}\"{duration}", crate::transcode::TC_FEATURES)
     } else {
+        let mime = if native { samsung_mime(mime) } else { mime };
         format!("protocolInfo=\"http-get:*:{mime}:{CONTENT_FEATURES}\" size=\"{size}\"{duration}")
     };
     format!(
@@ -366,7 +388,7 @@ fn item_xml(ctx: &Ctx, rel: &str, name: &str, size: u64, subs: &[String], base: 
     )
 }
 
-fn browse(ctx: &Ctx, id: &str, metadata: bool, start: usize, count: usize, base: &str) -> Option<(String, usize, usize)> {
+fn browse(ctx: &Ctx, id: &str, metadata: bool, start: usize, count: usize, base: &str, native: bool) -> Option<(String, usize, usize)> {
     let rel_in = if id == "0" { "" } else { id };
     let (full, rel) = safe_join(&ctx.root, rel_in)?;
     let meta = fs::metadata(&full).ok()?;
@@ -385,7 +407,7 @@ fn browse(ctx: &Ctx, id: &str, metadata: bool, start: usize, count: usize, base:
                 .find(|e| e.rel == rel)
                 .map(|e| e.subs)
                 .unwrap_or_default();
-            didl.push_str(&item_xml(ctx, &rel, &name, meta.len(), &subs, base));
+            didl.push_str(&item_xml(ctx, &rel, &name, meta.len(), &subs, base, native));
         }
         didl.push_str("</DIDL-Lite>");
         return Some((didl, 1, 1));
@@ -402,7 +424,7 @@ fn browse(ctx: &Ctx, id: &str, metadata: bool, start: usize, count: usize, base:
         if e.is_dir {
             didl.push_str(&container_xml(ctx, &e.rel, &e.name));
         } else {
-            didl.push_str(&item_xml(ctx, &e.rel, &e.name, e.size, &e.subs, base));
+            didl.push_str(&item_xml(ctx, &e.rel, &e.name, e.size, &e.subs, base, native));
         }
         returned += 1;
     }
@@ -428,6 +450,7 @@ const CDS_SCPD: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <argument><name>TotalMatches</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>
 <argument><name>UpdateID</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_UpdateID</relatedStateVariable></argument>
 </argumentList></action>
+<action><name>X_GetFeatureList</name><argumentList><argument><name>FeatureList</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Featurelist</relatedStateVariable></argument></argumentList></action>
 <action><name>GetSystemUpdateID</name><argumentList><argument><name>Id</name><direction>out</direction><relatedStateVariable>SystemUpdateID</relatedStateVariable></argument></argumentList></action>
 <action><name>GetSearchCapabilities</name><argumentList><argument><name>SearchCaps</name><direction>out</direction><relatedStateVariable>SearchCapabilities</relatedStateVariable></argument></argumentList></action>
 <action><name>GetSortCapabilities</name><argumentList><argument><name>SortCaps</name><direction>out</direction><relatedStateVariable>SortCapabilities</relatedStateVariable></argument></argumentList></action>
@@ -441,6 +464,7 @@ const CDS_SCPD: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <stateVariable sendEvents="no"><name>A_ARG_TYPE_SortCriteria</name><dataType>string</dataType></stateVariable>
 <stateVariable sendEvents="no"><name>A_ARG_TYPE_Result</name><dataType>string</dataType></stateVariable>
 <stateVariable sendEvents="no"><name>A_ARG_TYPE_UpdateID</name><dataType>ui4</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>A_ARG_TYPE_Featurelist</name><dataType>string</dataType></stateVariable>
 <stateVariable sendEvents="yes"><name>SystemUpdateID</name><dataType>ui4</dataType></stateVariable>
 <stateVariable sendEvents="no"><name>SearchCapabilities</name><dataType>string</dataType></stateVariable>
 <stateVariable sendEvents="no"><name>SortCapabilities</name><dataType>string</dataType></stateVariable>

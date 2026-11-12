@@ -16,6 +16,8 @@ pub struct Ctx {
     pub root: PathBuf,
     pub dlna: Option<&'static dlna::Device>,
     pub tc: Option<&'static Transcoder>,
+    /// Preferred subtitle language tag (e.g. "ms"), listed first.
+    pub sub_lang: Option<String>,
 }
 
 impl Ctx {
@@ -51,6 +53,30 @@ impl Ctx {
         }
         Some(tc.state(&full, &self.sibling_subs(rel)))
     }
+}
+
+/// Put subtitles whose tag (`Movie.<tag>.srt`) matches `lang` first.
+/// Clients that show only one subtitle (Samsung) use the first.
+pub fn order_subs(subs: &[String], video_name: &str, lang: Option<&str>) -> Vec<String> {
+    let mut v = subs.to_vec();
+    if let Some(lang) = lang {
+        let stem = video_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(video_name).to_lowercase();
+        let tag = |sub: &String| {
+            let file = sub.rsplit('/').next().unwrap_or(sub).to_lowercase();
+            let sub_stem = file.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or(file.clone());
+            sub_stem.strip_prefix(&stem).unwrap_or("").trim_start_matches('.').to_string()
+        };
+        v.sort_by_key(|s| !tag(s).eq_ignore_ascii_case(lang));
+    }
+    v
+}
+
+/// Samsung TVs/monitors (Tizen) play HEVC, MKV and external subtitles
+/// themselves, so they get the original files, never transcoded ones.
+pub fn is_samsung(req: &Request) -> bool {
+    let ua = req.header("user-agent").unwrap_or("").to_ascii_lowercase();
+    ua.contains("sec_hhp") || ua.contains("samsung") || ua.contains("tizen")
+        || req.header("getcaptioninfo.sec").is_some()
 }
 
 /// Short note shown next to a transcoded video's name.
@@ -201,7 +227,7 @@ fn handle(ctx: &Ctx, mut stream: TcpStream) -> io::Result<()> {
         if let CacheState::Ready(file) = tc.state(&full, &subs) {
             // Converted copy: a normal file, so Range requests (seeking) work.
             let len = fs::metadata(&file)?.len();
-            return serve_file(&mut stream, &req, &file, len, head);
+            return serve_file(&mut stream, &req, &file, len, head, &[]);
         }
         // Not converted yet: move it to the front of the queue and stream
         // it live in the meantime.
@@ -250,7 +276,39 @@ fn handle(ctx: &Ctx, mut stream: TcpStream) -> io::Result<()> {
             head,
         );
     }
-    serve_file(&mut stream, &req, &full, meta.len(), head)
+    let extra = samsung_headers(ctx, &req, &rel, local);
+    serve_file(&mut stream, &req, &full, meta.len(), head, &extra)
+}
+
+/// Samsung DLNA extensions on a media request:
+/// `getCaptionInfo.sec: 1` -> `CaptionInfo.sec: <subtitle url>`,
+/// `getMediaInfo.sec: 1` -> `MediaInfo.sec: SEC_Duration=<ms>;`.
+fn samsung_headers(ctx: &Ctx, req: &Request, rel: &str, local: SocketAddr) -> Vec<(String, String)> {
+    let mut extra = Vec::new();
+    if mime_for(rel).1 != Kind::Video {
+        return extra;
+    }
+    if req.header("getcaptioninfo.sec").is_some() {
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        let parent = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        let subs = safe_join(&ctx.root, parent)
+            .map(|(dir, _)| read_entries(&dir, parent))
+            .unwrap_or_default()
+            .into_iter()
+            .find(|e| e.rel == rel)
+            .map(|e| e.subs)
+            .unwrap_or_default();
+        if let Some(sub) = order_subs(&subs, name, ctx.sub_lang.as_deref()).first() {
+            extra.push(("CaptionInfo.sec".into(), format!("{}/{}", base_url(req, local), url_encode_path(sub))));
+        }
+    }
+    if req.header("getmediainfo.sec").is_some() {
+        let dur = ctx.tc.zip(safe_join(&ctx.root, rel)).and_then(|(tc, (full, _))| tc.probe(&full)).and_then(|p| p.duration);
+        if let Some(d) = dur {
+            extra.push(("MediaInfo.sec".into(), format!("SEC_Duration={};", (d * 1000.0) as u64)));
+        }
+    }
+    extra
 }
 
 /// `http://host:port` as seen by the client (Host header), falling back to the
@@ -284,9 +342,10 @@ fn parse_range(h: &str, len: u64) -> Option<Result<(u64, u64), ()>> {
     Some(r)
 }
 
-fn serve_file(stream: &mut TcpStream, req: &Request, path: &Path, len: u64, head: bool) -> io::Result<()> {
+fn serve_file(stream: &mut TcpStream, req: &Request, path: &Path, len: u64, head: bool, extra: &[(String, String)]) -> io::Result<()> {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let (mime, _) = mime_for(&name);
+    let mime = if is_samsung(req) { dlna::samsung_mime(mime) } else { mime };
     let mut file = match File::open(path) {
         Ok(f) => f,
         Err(_) => return respond(stream, "403 Forbidden", &[], b"Cannot open file", head),
@@ -310,6 +369,9 @@ fn serve_file(stream: &mut TcpStream, req: &Request, path: &Path, len: u64, head
     );
     if status.starts_with("206") {
         h.push_str(&format!("Content-Range: bytes {start}-{end}/{len}\r\n"));
+    }
+    for (k, v) in extra {
+        h.push_str(&format!("{k}: {v}\r\n"));
     }
     h.push_str("\r\n");
     stream.write_all(h.as_bytes())?;
@@ -490,5 +552,17 @@ mod tests {
         assert_eq!(parse_range("bytes=-10", 100), Some(Ok((90, 99))));
         assert_eq!(parse_range("bytes=100-", 100), Some(Err(())));
         assert_eq!(parse_range("items=1-2", 100), None);
+    }
+}
+
+#[cfg(test)]
+mod samsung_tests {
+    use super::*;
+
+    #[test]
+    fn preferred_sub_first() {
+        let subs = vec!["d/Movie.srt".to_string(), "d/Movie.ms.srt".to_string()];
+        assert_eq!(order_subs(&subs, "Movie.mkv", Some("ms"))[0], "d/Movie.ms.srt");
+        assert_eq!(order_subs(&subs, "Movie.mkv", None)[0], "d/Movie.srt");
     }
 }
