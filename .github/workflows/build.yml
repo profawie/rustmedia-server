@@ -15,3 +15,7 @@ jobs:
         with:
           name: rustmedia-windows-x64
           path: target/release/rustmedia.exe
+      # Exercise build.ps1 and the GNU-toolchain path (no Visual Studio needed).
+      - name: build.ps1 --gnu
+        shell: powershell
+        run: .\build.ps1 --gnu -SkipTests

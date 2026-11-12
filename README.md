@@ -148,7 +148,7 @@ On Windows, run the build script (needs Rust from https://rustup.rs):
 .\build.ps1                  # run tests, build, copy rustmedia.exe here
 .\build.ps1 -SkipTests       # build only
 .\build.ps1 -Output D:\Movies # also copy the exe into your video folder
-.\build.ps1 -Gnu             # use the GNU toolchain if MSVC Build Tools aren't installed
+.\build.ps1 -Gnu             # force the GNU toolchain (picked automatically without Visual Studio)
 ```
 
 If PowerShell refuses to run scripts: `powershell -ExecutionPolicy Bypass -File .\build.ps1`.
