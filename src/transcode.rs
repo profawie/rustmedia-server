@@ -413,7 +413,7 @@ impl Transcoder {
     /// Copy of `src` with the external subtitle files added as MKV tracks.
     /// Samsung TVs only list subtitles inside the file, never a sibling .srt.
     fn mux_file(&self, src: &Path, subs: &[PathBuf]) -> PathBuf {
-        self.cache_name(src, subs, "mux1", "mkv")
+        self.cache_name(src, subs, "mux2", "mkv")
     }
 
     /// The muxed copy, if it has been made.
@@ -457,6 +457,11 @@ impl Transcoder {
             cmd.args(["-map", &format!("{}:s:0", i + 1)]);
         }
         cmd.args(["-map", "0:s?", "-map", "0:t?", "-c", "copy"]);
+        // Samsung players show SRT tracks in the list but draw nothing for
+        // them; ASS tracks work, so the added files are converted to ASS.
+        for i in 0..subs.len() {
+            cmd.args([format!("-c:s:{i}"), "ass".to_string()]);
+        }
         cmd.args(["-disposition:s", "0", "-disposition:s:0", "default"]);
         for (i, sub) in subs.iter().enumerate() {
             let tag = sub_tag(src, sub);
