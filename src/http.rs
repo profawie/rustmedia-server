@@ -353,8 +353,8 @@ ul{{padding:0}} small{{color:#999}} .d a{{color:#fc6;font-weight:600}} .m a{{col
 .u{{display:block;color:#777;font-size:12px;font-family:monospace}}
 .box{{background:#222;padding:12px;border-radius:8px;font-size:14px}} code{{color:#9f9;word-break:break-all}}
 </style></head><body><h2>RustMedia {t}</h2>
-<div class=box>VLC &rarr; Media &rarr; Open Network Stream, tampal URL ini untuk senarai main (playlist) folder ini:<br><code>{pl}</code><br>
-<a href="{pl_href}">Muat turun playlist.m3u</a></div>
+<div class=box>VLC &rarr; Media &rarr; Open Network Stream, paste this URL to play this folder as a playlist:<br><code>{pl}</code><br>
+<a href="{pl_href}">Download playlist.m3u</a></div>
 <ul>
 {rows}</ul></body></html>"#,
         t = escape_xml(&title),

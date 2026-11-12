@@ -10,15 +10,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 const HELP: &str = "\
-RustMedia - kongsi folder video ke VLC melalui rangkaian (LAN)
+RustMedia - share a video folder with VLC over the local network (LAN)
 
-Guna:  rustmedia.exe [FOLDER] [--port N] [--name NAMA] [--no-dlna]
+Usage: rustmedia.exe [FOLDER] [--port N] [--name NAME] [--no-dlna]
 
-  FOLDER       Folder untuk dikongsi (lalai: folder semasa)
-  --port N     Port HTTP (lalai: 8080; cuba port seterusnya jika sibuk)
-  --name NAMA  Nama yang dipaparkan di VLC > Local Network (UPnP)
-  --no-dlna    Matikan penemuan UPnP/DLNA
-  -h, --help   Papar bantuan ini
+  FOLDER       Folder to share (default: current directory)
+  --port N     HTTP port (default: 8080; tries the next port if busy)
+  --name NAME  Name shown in VLC > Local Network (UPnP)
+  --no-dlna    Disable UPnP/DLNA discovery
+  -h, --help   Show this help
 ";
 
 struct Args {
@@ -38,12 +38,12 @@ fn parse_args() -> Result<Args, String> {
                 std::process::exit(0);
             }
             "-p" | "--port" => {
-                let v = it.next().ok_or("--port perlukan nombor")?;
-                a.port = Some(v.parse().map_err(|_| format!("port tidak sah: {v}"))?);
+                let v = it.next().ok_or("--port needs a number")?;
+                a.port = Some(v.parse().map_err(|_| format!("invalid port: {v}"))?);
             }
-            "--name" => a.name = Some(it.next().ok_or("--name perlukan nilai")?),
+            "--name" => a.name = Some(it.next().ok_or("--name needs a value")?),
             "--no-dlna" => a.dlna = false,
-            s if s.starts_with('-') => return Err(format!("pilihan tidak dikenali: {s}\n\n{HELP}")),
+            s if s.starts_with('-') => return Err(format!("unknown option: {s}\n\n{HELP}")),
             s => a.dir = Some(PathBuf::from(s)),
         }
     }
@@ -52,8 +52,8 @@ fn parse_args() -> Result<Args, String> {
 
 /// Keep the console window open when started by double-click so errors can be read.
 fn fail(msg: &str) -> ! {
-    eprintln!("\nRALAT: {msg}");
-    eprintln!("Tekan Enter untuk keluar...");
+    eprintln!("\nERROR: {msg}");
+    eprintln!("Press Enter to exit...");
     let _ = std::io::stdin().read_line(&mut String::new());
     std::process::exit(1);
 }
@@ -62,13 +62,13 @@ fn main() {
     let args = parse_args().unwrap_or_else(|e| fail(&e));
     let dir = match args.dir {
         Some(d) => d,
-        None => std::env::current_dir().unwrap_or_else(|e| fail(&format!("tidak dapat baca folder semasa: {e}"))),
+        None => std::env::current_dir().unwrap_or_else(|e| fail(&format!("cannot read current directory: {e}"))),
     };
     let root = dir
         .canonicalize()
-        .unwrap_or_else(|e| fail(&format!("folder '{}' tidak wujud: {e}", dir.display())));
+        .unwrap_or_else(|e| fail(&format!("folder '{}' does not exist: {e}", dir.display())));
     if !root.is_dir() {
-        fail(&format!("'{}' bukan folder", root.display()));
+        fail(&format!("'{}' is not a folder", root.display()));
     }
     // canonicalize() on Windows yields `\\?\C:\...`; strip it for display.
     let shown_root = root.display().to_string().trim_start_matches(r"\\?\").to_string();
@@ -77,11 +77,11 @@ fn main() {
     let (listener, port) = match args.port {
         Some(p) => match TcpListener::bind(("0.0.0.0", p)) {
             Ok(l) => (l, p),
-            Err(e) => fail(&format!("port {p} tidak dapat dibuka: {e}")),
+            Err(e) => fail(&format!("cannot open port {p}: {e}")),
         },
         None => (8080..8100)
             .find_map(|p| TcpListener::bind(("0.0.0.0", p)).ok().map(|l| (l, p)))
-            .unwrap_or_else(|| fail("tiada port kosong antara 8080-8099")),
+            .unwrap_or_else(|| fail("no free port between 8080-8099")),
     };
 
     // Initial scan for the summary.
@@ -112,36 +112,36 @@ fn main() {
     });
 
     println!("============================================================");
-    println!(" RustMedia {}  -  media server untuk VLC", env!("CARGO_PKG_VERSION"));
+    println!(" RustMedia {}  -  media server for VLC", env!("CARGO_PKG_VERSION"));
     println!("============================================================");
     println!(" Folder   : {shown_root}");
     println!(
-        " Dijumpai : {} fail video/audio ({:.2} GB)",
+        " Found    : {} video/audio files ({:.2} GB)",
         media.len(),
         total_size as f64 / 1_073_741_824.0
     );
     println!();
-    println!(" Di VLC: Media > Open Network Stream, masukkan:");
+    println!(" In VLC: Media > Open Network Stream, enter:");
     println!();
-    println!("   http://{ip}:{port}/playlist.m3u      <- semua video (playlist)");
-    println!("   http://{ip}:{port}/                  <- senarai fail (pelayar web)");
+    println!("   http://{ip}:{port}/playlist.m3u      <- all videos (playlist)");
+    println!("   http://{ip}:{port}/                  <- file list (web browser)");
     println!();
     if let Some(dev) = device {
         match dlna::start_ssdp(dev, ip, port) {
             None => {
-                println!(" UPnP/DLNA: aktif. Di VLC (TV/telefon) buka Local Network /");
-                println!("   Universal Plug'n'Play, pilih \"{}\".", dev.name);
+                println!(" UPnP/DLNA: on. In VLC (TV/phone) open Local Network /");
+                println!("   Universal Plug'n'Play and choose \"{}\".", dev.name);
             }
             Some(w) => println!(" UPnP/DLNA: {w}"),
         }
         println!();
     }
     if ip.is_loopback() {
-        println!(" AMARAN: tiada rangkaian dikesan. Sambung ke Wi-Fi dahulu.");
+        println!(" WARNING: no network detected. Connect to Wi-Fi first.");
     }
-    println!(" Laptop dan TV mesti dalam Wi-Fi/rangkaian yang sama.");
-    println!(" Jika Windows Firewall bertanya, pilih 'Allow' (Private network).");
-    println!(" Tekan Ctrl+C untuk berhenti.");
+    println!(" The laptop and TV must be on the same Wi-Fi/network.");
+    println!(" If Windows Firewall asks, choose 'Allow' (Private network).");
+    println!(" Press Ctrl+C to stop.");
     println!("============================================================");
 
     http::run(ctx, listener);

@@ -1,71 +1,70 @@
 # RustMedia
 
-Media server kecil untuk Windows, ditulis sepenuhnya dalam Rust. Jalankan
-`rustmedia.exe` dalam folder video anda, dan VLC di laptop, telefon atau TV
-(dalam Wi-Fi yang sama) boleh pilih dan main video dari folder itu.
+A small media server for Windows, written entirely in Rust. Run
+`rustmedia.exe` inside your video folder and VLC on your laptop, phone or TV
+(on the same Wi-Fi) can browse and play the videos in that folder.
 
-## Cara guna
+## Usage
 
-1. Salin `rustmedia.exe` ke folder video (contoh `D:\Filem`), kemudian
-   double-click, atau dari terminal:
+1. Copy `rustmedia.exe` into your video folder (e.g. `D:\Movies`) and
+   double-click it, or from a terminal:
 
    ```
-   cd D:\Filem
+   cd D:\Movies
    rustmedia.exe
    ```
 
-2. Kali pertama, Windows Firewall akan bertanya. Pilih **Allow** untuk
-   rangkaian **Private**. (Jika Wi-Fi rumah ditetapkan sebagai *Public*,
-   tukar ke *Private* di Settings > Network, atau benarkan juga Public.)
+2. The first time, Windows Firewall will ask for permission. Choose
+   **Allow** for **Private** networks. (If your home Wi-Fi is set to
+   *Public*, switch it to *Private* in Settings > Network, or allow Public too.)
 
-3. Program akan papar alamat seperti:
+3. The program prints addresses like:
 
    ```
-   http://192.168.1.23:8080/playlist.m3u      <- semua video (playlist)
-   http://192.168.1.23:8080/                  <- senarai fail (pelayar web)
+   http://192.168.1.23:8080/playlist.m3u      <- all videos (playlist)
+   http://192.168.1.23:8080/                  <- file list (web browser)
    ```
 
-4. Di VLC:
-   - **Cara A (taip URL):** Media > Open Network Stream, masukkan
-     `http://<ip>:8080/playlist.m3u`. Semua video (termasuk subfolder)
-     muncul dalam playlist; pilih mana-mana dan main. Seek/lompat masa
-     berfungsi.
-   - **Cara B (tanpa taip, sesuai untuk TV):** buka *Local Network* /
-     *Universal Plug'n'Play* (UPnP) dan pilih **RustMedia - <folder> (<PC>)**.
-     Anda boleh browse folder dan pilih video terus.
+4. In VLC:
+   - **Option A (type a URL):** Media > Open Network Stream, enter
+     `http://<ip>:8080/playlist.m3u`. Every video (including subfolders)
+     appears in the playlist; pick one and play. Seeking works.
+   - **Option B (no typing, best for TVs):** open *Local Network* /
+     *Universal Plug'n'Play* (UPnP) and choose **RustMedia - <folder> (<PC>)**.
+     You can browse folders and pick a video directly.
 
-Senarai fail juga boleh dibuka dengan pelayar web di `http://<ip>:8080/`.
-Setiap folder ada playlist sendiri: `http://<ip>:8080/playlist.m3u?dir=Nama%20Folder`.
+The file list can also be opened in a web browser at `http://<ip>:8080/`.
+Each folder has its own playlist: `http://<ip>:8080/playlist.m3u?dir=Folder%20Name`.
 
-## Pilihan
+## Options
 
 ```
-rustmedia.exe [FOLDER] [--port N] [--name NAMA] [--no-dlna]
+rustmedia.exe [FOLDER] [--port N] [--name NAME] [--no-dlna]
 ```
 
-| Pilihan | Maksud |
+| Option | Meaning |
 | --- | --- |
-| `FOLDER` | Folder dikongsi (lalai: folder semasa) |
-| `--port N` | Port HTTP (lalai 8080, cuba 8081.. jika sibuk) |
-| `--name NAMA` | Nama di VLC > Local Network |
-| `--no-dlna` | Matikan penemuan UPnP/DLNA |
+| `FOLDER` | Folder to share (default: current directory) |
+| `--port N` | HTTP port (default 8080, tries 8081.. if busy) |
+| `--name NAME` | Name shown in VLC > Local Network |
+| `--no-dlna` | Disable UPnP/DLNA discovery |
 
-## Kekangan
+## Limitations
 
-- Laptop dan TV mesti dalam rangkaian yang sama. Sesetengah router
-  "Guest Wi-Fi" atau "AP isolation" menghalang peranti saling bercakap.
-- Tiada transcoding: fail dihantar seperti asal. Sama ada video boleh dimain
-  bergantung pada VLC di TV (VLC biasanya sokong hampir semua format, tetapi
-  video 4K/HEVC berat mungkin tersekat pada TV lama atau Wi-Fi lemah).
-- Subtitle berasingan (`.srt`) tidak dimuat automatik melalui URL. Gunakan
-  subtitle dalam fail (contohnya MKV) atau tambah sendiri dalam VLC.
-- Program hanya untuk rangkaian rumah: tiada kata laluan, sesiapa dalam
-  Wi-Fi yang sama boleh lihat folder yang dikongsi.
-- Laptop jangan *sleep* semasa menonton.
+- The laptop and TV must be on the same network. Some routers' "Guest Wi-Fi"
+  or "AP isolation" stop devices from talking to each other.
+- No transcoding: files are sent as-is. Whether a video plays depends on VLC
+  on the TV (VLC supports almost every format, but heavy 4K/HEVC video may
+  stutter on old TVs or weak Wi-Fi).
+- Separate subtitle files (`.srt`) are not loaded automatically over the URL.
+  Use subtitles embedded in the file (e.g. MKV) or add them in VLC.
+- Intended for home networks only: there is no password, so anyone on the
+  same Wi-Fi can see the shared folder.
+- Don't let the laptop sleep while watching.
 
-## Bina dari kod
+## Building
 
 ```
-cargo build --release                                     # di Windows
-cargo build --release --target x86_64-pc-windows-gnu      # cross-compile dari Linux (perlu mingw-w64)
+cargo build --release                                     # on Windows
+cargo build --release --target x86_64-pc-windows-gnu      # cross-compile from Linux (needs mingw-w64)
 ```

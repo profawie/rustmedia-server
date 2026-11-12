@@ -86,7 +86,7 @@ pub fn start_ssdp(dev: &'static Device, ip: Ipv4Addr, port: u16) -> Option<Strin
             std::thread::spawn(move || listen(sock, dev, &location));
         }
         Err(e) => {
-            warning = Some(format!("SSDP port 1900 tidak dapat dibuka ({e}); hanya pengumuman (NOTIFY) dihantar."))
+            warning = Some(format!("could not open SSDP port 1900 ({e}); sending announcements (NOTIFY) only."))
         }
     }
 
