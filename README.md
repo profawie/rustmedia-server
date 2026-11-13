@@ -65,21 +65,26 @@ Samsung Tizen TVs and Smart Monitors (e.g. M7) have a built-in DLNA player:
 Samsung players decode HEVC, MKV and 10-bit video themselves, so they get
 the original files (no conversion, seeking works).
 
-Samsung players only list subtitles that are *inside* the video file, and
-ignore `.srt` files next to it. So when a video has subtitle files,
-RustMedia (with ffmpeg available) makes a copy of it with those subtitles
-added as tracks, e.g. **Malay** from `Movie.ms.srt`. Nothing is re-encoded,
-so this takes about as long as copying the file. It starts the first time
-the monitor opens the folder; meanwhile the video's name ends with
-"(adding subtitles, open again in a minute)". The copies are kept in
-`.rustmedia-cache` and need as much disk space as the originals.
-
-Choose a track in the player's **Subtitle Settings**. The track from
-`--sub-lang` is first and marked default:
+Samsung players ignore `.srt` files next to the video, and on the
+Smart Monitor M7 they also show nothing for subtitle tracks added to a
+file. So with `--sub-lang`, RustMedia (with ffmpeg available) makes a copy
+of the video with that language's subtitles **burned into the picture**:
 
 ```
-rustmedia.exe --sub-lang ms      # Movie.ms.srt first
+rustmedia.exe --sub-lang ms      # burns Movie.ms.srt into Movie.mkv for Samsung
 ```
+
+The video is re-encoded to H.264, so this takes a while (roughly the
+length of the film or less, depending on the laptop; `--encoder
+h264_nvenc` / `h264_qsv` / `h264_amf` is much faster on a GPU). It starts
+the first time the monitor opens the folder; meanwhile the video's name
+ends with "(ms subtitles: burning in N%, open again later)" and the
+original plays. The copies are kept in `.rustmedia-cache`. Burned-in
+subtitles can't be switched off on the monitor.
+
+Without `--sub-lang`, videos with subtitle files get a copy with those
+files added as subtitle tracks (no re-encoding), which some Samsung models
+show in **Subtitle Settings**.
 
 Without ffmpeg the monitor gets one subtitle file through Samsung's
 `CaptionInfo.sec` extension, which some models ignore.
@@ -139,7 +144,7 @@ rustmedia.exe [FOLDER] [--port N] [--name NAME] [--no-dlna] [--no-transcode] [--
 | `--no-dlna` | Disable UPnP/DLNA discovery |
 | `--no-transcode` | Never transcode, always send files as-is |
 | `--encoder NAME` | ffmpeg H.264 encoder (default `libx264`) |
-| `--sub-lang TAG` | Subtitle listed first / used by Samsung (`ms` = `Movie.ms.srt`) |
+| `--sub-lang TAG` | Subtitle listed first; burned into the picture for Samsung (`ms` = `Movie.ms.srt`) |
 
 ## Limitations
 

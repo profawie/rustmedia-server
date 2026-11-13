@@ -48,7 +48,7 @@ pub struct Transcoder {
 #[derive(Default)]
 struct Jobs {
     queue: VecDeque<Job>,
-    /// Source being converted and its progress (0.0-1.0).
+    /// Output file being made and its progress (0.0-1.0).
     current: Option<(PathBuf, f32)>,
     failed: HashSet<PathBuf>,
 }
@@ -56,6 +56,9 @@ struct Jobs {
 struct Job {
     src: PathBuf,
     subs: Vec<PathBuf>,
+    /// Subtitle file to burn into the picture (Samsung) instead of adding tracks.
+    burn: Option<PathBuf>,
+    target: PathBuf,
 }
 
 /// Where a video stands in the conversion cache.
@@ -174,7 +177,7 @@ impl Transcoder {
         if head {
             return out.flush();
         }
-        let mut cmd = self.encode_cmd(path, subs);
+        let mut cmd = self.encode_cmd(path, subs, None);
         cmd.args(["-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1"]);
         let mut child: Child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
         let res = (|| {
@@ -195,7 +198,9 @@ impl Transcoder {
     }
 
     /// ffmpeg command with inputs, stream mapping and codecs; the caller adds the output.
-    fn encode_cmd(&self, path: &Path, subs: &[PathBuf]) -> Command {
+    /// `burn`: subtitle file name (relative to ffmpeg's working folder) to
+    /// draw into the picture; no subtitle tracks are written then.
+    fn encode_cmd(&self, path: &Path, subs: &[PathBuf], burn: Option<&str>) -> Command {
         let mut cmd = Command::new(&self.ffmpeg);
         cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"]).arg(path);
         for sub in subs {
@@ -204,7 +209,7 @@ impl Transcoder {
         cmd.args(["-map", "0:v:0", "-map", "0:a?"]);
         // Embedded subtitles: only text ones can become MP4 (mov_text)
         // tracks; picture-based ones (PGS, VobSub) are skipped.
-        let embedded: Vec<usize> = self
+        let embedded: Vec<usize> = if burn.is_some() { Vec::new() } else { self
             .probe(path)
             .map(|p| {
                 p.sub_codecs
@@ -214,7 +219,7 @@ impl Transcoder {
                     .map(|(i, _)| i)
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or_default() };
         for i in &embedded {
             cmd.args(["-map", &format!("0:s:{i}")]);
         }
@@ -231,7 +236,11 @@ impl Transcoder {
         // every 2 s keeps fragments small so playback starts quickly.
         // Intel Quick Sync wants NV12; everything else takes yuv420p.
         let pix_fmt = if self.encoder.ends_with("_qsv") { "nv12" } else { "yuv420p" };
-        cmd.args(["-vf", "scale='min(1920,iw)':-2", "-pix_fmt", pix_fmt, "-profile:v", "high", "-level:v", "4.1"]);
+        let mut vf = "scale='min(1920,iw)':-2".to_string();
+        if let Some(file) = burn {
+            vf.push_str(&format!(",subtitles=filename={file}"));
+        }
+        cmd.args(["-vf", vf.as_str(), "-pix_fmt", pix_fmt, "-profile:v", "high", "-level:v", "4.1"]);
         cmd.args(["-force_key_frames", "expr:gte(t,n_forced*2)"]);
         cmd.args(["-c:a", "aac", "-ac", "2", "-b:a", "192k"]);
         let n_subs = embedded.len() + subs.len();
@@ -281,36 +290,61 @@ impl Transcoder {
     }
 
     pub fn state(&self, src: &Path, subs: &[PathBuf]) -> CacheState {
-        let file = self.cache_file(src, subs);
+        self.target_state(&self.cache_file(src, subs))
+    }
+
+    fn target_state(&self, file: &Path) -> CacheState {
         if file.is_file() {
-            return CacheState::Ready(file);
+            return CacheState::Ready(file.to_path_buf());
         }
         let jobs = self.jobs.lock().unwrap();
         match &jobs.current {
-            Some((p, pct)) if p == src => CacheState::Converting(*pct),
-            _ if jobs.failed.contains(src) => CacheState::Failed,
+            Some((p, pct)) if p == file => CacheState::Converting(*pct),
+            _ if jobs.failed.contains(file) => CacheState::Failed,
             _ => CacheState::Waiting,
         }
     }
 
     /// Queue a conversion. `urgent` puts it first (someone wants to watch it).
     pub fn enqueue(&self, src: PathBuf, subs: Vec<PathBuf>, urgent: bool) {
-        if self.cache_file(&src, &subs).is_file() {
+        let target = self.cache_file(&src, &subs);
+        self.push_job(Job { src, subs, burn: None, target }, urgent);
+    }
+
+    /// Copy of `src` with `sub` burned into the picture, for players that
+    /// show no subtitle tracks we add (Samsung).
+    fn burn_file(&self, src: &Path, sub: &Path) -> PathBuf {
+        self.cache_name(src, &[sub.to_path_buf()], &format!("burn1-{}", self.encoder), "mp4")
+    }
+
+    /// State of the burned-in copy; queues it (first in line) if missing.
+    pub fn burned(&self, src: &Path, sub: &Path) -> CacheState {
+        let target = self.burn_file(src, sub);
+        let st = self.target_state(&target);
+        if matches!(st, CacheState::Waiting) {
+            let job = Job { src: src.to_path_buf(), subs: Vec::new(), burn: Some(sub.to_path_buf()), target };
+            self.push_job(job, true);
+        }
+        st
+    }
+
+    fn push_job(&self, job: Job, urgent: bool) {
+        if job.target.is_file() {
             return;
         }
         let mut jobs = self.jobs.lock().unwrap();
-        if jobs.failed.contains(&src) || jobs.current.as_ref().is_some_and(|(p, _)| *p == src) {
+        if jobs.failed.contains(&job.target) || jobs.current.as_ref().is_some_and(|(p, _)| *p == job.target) {
             return;
         }
-        let existing = jobs.queue.iter().position(|j| j.src == src);
+        let existing = jobs.queue.iter().position(|j| j.target == job.target);
         match (existing, urgent) {
             (Some(_), false) => return,
+            (Some(0), true) => return,
             (Some(i), true) => {
                 jobs.queue.remove(i);
             }
             _ => {}
         }
-        let job = Job { src, subs };
         if urgent { jobs.queue.push_front(job) } else { jobs.queue.push_back(job) }
         self.wake.notify_all();
     }
@@ -322,7 +356,7 @@ impl Transcoder {
                 let mut jobs = self.jobs.lock().unwrap();
                 loop {
                     if let Some(j) = jobs.queue.pop_front() {
-                        jobs.current = Some((j.src.clone(), 0.0));
+                        jobs.current = Some((j.target.clone(), 0.0));
                         break j;
                     }
                     jobs = self.wake.wait(jobs).unwrap();
@@ -332,23 +366,43 @@ impl Transcoder {
             let mut jobs = self.jobs.lock().unwrap();
             jobs.current = None;
             if !ok {
-                jobs.failed.insert(job.src);
+                jobs.failed.insert(job.target);
             }
         });
     }
 
     fn convert(&self, job: &Job) -> bool {
         let name = job.src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let target = self.cache_file(&job.src, &job.subs);
+        let target = job.target.clone();
         if target.is_file() {
             return true;
         }
         let part = target.with_extension("mp4.part");
         let duration = self.probe(&job.src).and_then(|p| p.duration).unwrap_or(0.0);
-        println!(" Converting for TV: {name}");
+        // The subtitles filter takes a file name inside a filter string, where
+        // Windows paths (C:\...) need awkward escaping. Copy the file into the
+        // cache folder under a plain name and run ffmpeg there instead.
+        let burn_copy = job.burn.as_ref().map(|sub| {
+            let ext = sub.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_else(|| "srt".into());
+            let stem = target.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let hash = stem.rsplit('.').next().unwrap_or("sub").to_string();
+            (sub.clone(), format!("burn-{hash}.{ext}"))
+        });
+        if let Some((sub, file)) = &burn_copy {
+            if let Err(e) = std::fs::copy(sub, self.cache_dir.join(file)) {
+                println!(" Cannot read subtitle {}: {e}", sub.display());
+                return false;
+            }
+            println!(" Burning subtitles into {name} for Samsung (re-encodes the video, takes a while)");
+        } else {
+            println!(" Converting for TV: {name}");
+        }
         let started = Instant::now();
 
-        let mut cmd = self.encode_cmd(&job.src, &job.subs);
+        let mut cmd = self.encode_cmd(&job.src, &job.subs, burn_copy.as_ref().map(|(_, f)| f.as_str()));
+        if burn_copy.is_some() {
+            cmd.current_dir(&self.cache_dir);
+        }
         cmd.args(["-movflags", "+faststart", "-progress", "pipe:1", "-nostats", "-y", "-f", "mp4"]).arg(&part);
         // Below-normal priority, so a video being watched (streamed live)
         // gets the CPU first.
@@ -396,6 +450,9 @@ impl Transcoder {
         }
         let status = child.wait();
         let errors = errors.join().unwrap_or_default();
+        if let Some((_, file)) = &burn_copy {
+            let _ = std::fs::remove_file(self.cache_dir.join(file));
+        }
         if status.is_ok_and(|s| s.success()) && std::fs::rename(&part, &target).is_ok() {
             let mins = started.elapsed().as_secs_f64() / 60.0;
             println!(" Ready for TV (seekable): {name} ({mins:.1} min)");
