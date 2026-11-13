@@ -21,7 +21,8 @@ Usage: rustmedia.exe [FOLDER] [--port N] [--name NAME] [--no-dlna]
   --name NAME  Name shown in VLC > Local Network (UPnP)
   --no-dlna    Disable UPnP/DLNA discovery
   --no-transcode  Never transcode, always send files as-is
-  --sub-lang TAG  Subtitle shown first / on Samsung TVs, from Movie.TAG.srt
+  --sub-lang TAG  Subtitle shown first; burned into the video for Samsung
+                  TVs, from Movie.TAG.srt
                   (e.g. --sub-lang ms for Movie.ms.srt)
   --encoder NAME  ffmpeg H.264 encoder (default: libx264; GPU options:
                   h264_nvenc, h264_qsv, h264_amf)

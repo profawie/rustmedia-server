@@ -50,6 +50,24 @@ impl Ctx {
             .unwrap_or_default()
     }
 
+    /// For Samsung with `--sub-lang`: state of the copy of `rel` with that
+    /// language's subtitle file burned into the picture (queued if missing).
+    /// `None` when there is no such subtitle file.
+    pub fn samsung_burn(&self, rel: &str) -> Option<CacheState> {
+        let tc = self.tc?;
+        let lang = self.sub_lang.as_deref()?;
+        if mime_for(rel).1 != Kind::Video {
+            return None;
+        }
+        let (full, _) = safe_join(&self.root, rel)?;
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        let sub = self
+            .sibling_subs(rel)
+            .into_iter()
+            .find(|s| sub_tag(&s.to_string_lossy(), name).eq_ignore_ascii_case(lang))?;
+        Some(tc.burned(&full, &sub))
+    }
+
     /// For Samsung: the copy of `rel` with its subtitle files muxed in, if
     /// made. Otherwise starts making it and returns `None`.
     pub fn samsung_copy(&self, rel: &str) -> Option<PathBuf> {
@@ -85,15 +103,17 @@ impl Ctx {
 pub fn order_subs(subs: &[String], video_name: &str, lang: Option<&str>) -> Vec<String> {
     let mut v = subs.to_vec();
     if let Some(lang) = lang {
-        let stem = video_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(video_name).to_lowercase();
-        let tag = |sub: &String| {
-            let file = sub.rsplit('/').next().unwrap_or(sub).to_lowercase();
-            let sub_stem = file.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or(file.clone());
-            sub_stem.strip_prefix(&stem).unwrap_or("").trim_start_matches('.').to_string()
-        };
-        v.sort_by_key(|s| !tag(s).eq_ignore_ascii_case(lang));
+        v.sort_by_key(|s| !sub_tag(s, video_name).eq_ignore_ascii_case(lang));
     }
     v
+}
+
+/// `Movie.mkv` + `dir/Movie.ms.srt` -> "ms".
+fn sub_tag(sub: &str, video_name: &str) -> String {
+    let stem = video_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(video_name).to_lowercase();
+    let file = sub.rsplit(['/', '\\']).next().unwrap_or(sub).to_lowercase();
+    let sub_stem = file.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or(file.clone());
+    sub_stem.strip_prefix(&stem).unwrap_or("").trim_start_matches('.').to_string()
 }
 
 /// Samsung TVs/monitors (Tizen) play HEVC, MKV and external subtitles
@@ -261,6 +281,22 @@ fn handle(ctx: &Ctx, mut stream: TcpStream) -> io::Result<()> {
         }
         stream.set_read_timeout(None)?;
         return tc.stream(&mut stream, &full, &subs, head);
+    }
+
+    if let Some(rest) = req.path.strip_prefix("/_burn/") {
+        // Samsung: the video with the --sub-lang subtitles burned in.
+        let rel = percent_decode(rest, false);
+        let Some((full, rel)) = safe_join(&ctx.root, &rel) else {
+            return respond(&mut stream, "400 Bad Request", &[], b"bad path", head);
+        };
+        let file = match ctx.samsung_burn(&rel) {
+            Some(CacheState::Ready(f)) => f,
+            _ => full,
+        };
+        let Ok(meta) = fs::metadata(&file) else {
+            return respond(&mut stream, "404 Not Found", &[], b"Not found", head);
+        };
+        return serve_file(&mut stream, &req, &file, meta.len(), head, &[]);
     }
 
     if let Some(rest) = req.path.strip_prefix("/_mux/") {

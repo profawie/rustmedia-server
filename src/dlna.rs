@@ -345,18 +345,39 @@ fn item_xml(ctx: &Ctx, rel: &str, name: &str, size: u64, subs: &[String], base: 
     // the subtitle files muxed in (made on first browse, takes a minute).
     let mut size = size;
     let mut title = title;
-    let muxed = if native && kind == Kind::Video && !subs.is_empty() { ctx.samsung_copy(rel) } else { None };
-    if let Some(file) = &muxed {
+    // With --sub-lang, Samsung gets that subtitle burned into the picture:
+    // its player draws no subtitle track that RustMedia adds to a file.
+    let burn = if native && kind == Kind::Video { ctx.samsung_burn(rel) } else { None };
+    let mut burned = None;
+    match &burn {
+        Some(CacheState::Ready(file)) => burned = Some(file.clone()),
+        Some(st) => {
+            let lang = ctx.sub_lang.as_deref().unwrap_or("");
+            let note = match st {
+                CacheState::Converting(p) => format!("{lang} subtitles: burning in {:.0}%, open again later", p * 100.0),
+                CacheState::Failed => format!("{lang} subtitles: burning in failed"),
+                _ => format!("{lang} subtitles: waiting to burn in, open again later"),
+            };
+            title = format!("{title} ({note})");
+        }
+        None => {}
+    }
+    let muxed = if burn.is_none() && native && kind == Kind::Video && !subs.is_empty() { ctx.samsung_copy(rel) } else { None };
+    if let Some(file) = &burned {
+        path = format!("/_burn/{}", url_encode_path(rel));
+        size = fs::metadata(file).map(|m| m.len()).unwrap_or(size);
+    } else if let Some(file) = &muxed {
         path = format!("/_mux/{}", url_encode_path(rel));
         size = fs::metadata(file).map(|m| m.len()).unwrap_or(size);
-    } else if native
+    } else if burn.is_none()
+        && native
         && kind == Kind::Video
         && ctx.tc.zip(safe_join(&ctx.root, rel)).is_some_and(|(tc, (full, _))| tc.muxing(&full))
     {
         title = format!("{title} (adding subtitles, open again in a minute)");
     }
     // A transcoded or muxed video already carries its subtitles as tracks.
-    let subs = if transcoded || muxed.is_some() { Vec::new() } else { crate::http::order_subs(subs, name, ctx.sub_lang.as_deref()) };
+    let subs = if transcoded || muxed.is_some() || burned.is_some() { Vec::new() } else { crate::http::order_subs(subs, name, ctx.sub_lang.as_deref()) };
     let mut captions = String::new();
     let mut sub_res = String::new();
     for (i, sub) in subs.iter().enumerate() {
@@ -389,7 +410,7 @@ fn item_xml(ctx: &Ctx, rel: &str, name: &str, size: u64, subs: &[String], base: 
     } else if transcoded {
         format!("protocolInfo=\"http-get:*:video/mp4:{}\"{duration}", crate::transcode::TC_FEATURES)
     } else {
-        let mime = if native { samsung_mime(mime) } else { mime };
+        let mime = if burned.is_some() { "video/mp4" } else if native { samsung_mime(mime) } else { mime };
         format!("protocolInfo=\"http-get:*:{mime}:{CONTENT_FEATURES}\" size=\"{size}\"{duration}")
     };
     format!(
