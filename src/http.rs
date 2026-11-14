@@ -3,9 +3,10 @@
 
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::dlna;
@@ -18,13 +19,78 @@ pub struct Ctx {
     pub tc: Option<&'static Transcoder>,
     /// Preferred subtitle language tag (e.g. "ms"), listed first.
     pub sub_lang: Option<String>,
+    /// What kind of player each client address turned out to be.
+    pub clients: Mutex<HashMap<IpAddr, Profile>>,
+}
+
+/// What a client gets.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Profile {
+    /// Samsung TV / Smart Monitor: original files, or with `--sub-lang` an
+    /// H.264 copy with those subtitles burned in.
+    Samsung,
+    /// VLC on a TV (Google TV / Android TV): videos its decoder can't handle
+    /// are converted to H.264, subtitles as selectable tracks.
+    Tv,
+    /// VLC on a PC or Mac: always the original files, full quality.
+    Pc,
+}
+
+impl Profile {
+    pub fn label(self) -> &'static str {
+        match self {
+            Profile::Samsung => "Samsung TV (subtitles burned in with --sub-lang)",
+            Profile::Tv => "TV with VLC (H.264 copies, subtitle tracks)",
+            Profile::Pc => "PC/Mac VLC (original files, full quality)",
+        }
+    }
 }
 
 impl Ctx {
+    /// Work out what kind of player sent `req`, and remember it for the
+    /// client's address: VLC's own HTTP requests don't say which OS it runs
+    /// on, but its UPnP requests do (Windows/Darwin vs Linux/Android).
+    pub fn profile(&self, req: &Request, peer: IpAddr, local: IpAddr) -> Profile {
+        if let Some(p) = req.query_param("for").and_then(|v| match v.as_str() {
+            "pc" | "mac" => Some(Profile::Pc),
+            "tv" => Some(Profile::Tv),
+            "samsung" => Some(Profile::Samsung),
+            _ => None,
+        }) {
+            return p;
+        }
+        let ua = req.header("user-agent").unwrap_or("").to_ascii_lowercase();
+        let detected = if is_samsung(req) {
+            Some(Profile::Samsung)
+        } else if ["windows", "darwin", "macintosh", "mac os"].iter().any(|k| ua.contains(k)) {
+            Some(Profile::Pc)
+        } else if ["android", "linux"].iter().any(|k| ua.contains(k)) {
+            Some(Profile::Tv)
+        } else {
+            None
+        };
+        let mut clients = self.clients.lock().unwrap();
+        let known = clients.get(&peer).copied();
+        // Samsung is the strongest signal; never downgrade from it.
+        let profile = match (detected, known) {
+            (_, Some(Profile::Samsung)) => Profile::Samsung,
+            (Some(d), _) => d,
+            (None, Some(k)) => k,
+            // Same machine as RustMedia: VLC on this PC.
+            (None, None) if peer.is_loopback() || peer == local => Profile::Pc,
+            (None, None) => Profile::Tv,
+        };
+        if known != Some(profile) && (detected.is_some() || known.is_none()) {
+            clients.insert(peer, profile);
+            println!(" Client {peer}: {}", profile.label());
+        }
+        profile
+    }
+
     /// URL path a client should use to play `rel`: the original file, or
     /// `/_tc/...` when it has to be transcoded for the TV.
-    pub fn play_path(&self, rel: &str) -> (String, bool) {
-        let needs_tc = self.tc.is_some_and(|tc| {
+    pub fn play_path(&self, rel: &str, profile: Profile) -> (String, bool) {
+        let needs_tc = profile == Profile::Tv && self.tc.is_some_and(|tc| {
             mime_for(rel).1 == Kind::Video
                 && safe_join(&self.root, rel).is_some_and(|(full, _)| tc.needs_transcode(&full))
         });
@@ -244,17 +310,34 @@ fn handle(ctx: &Ctx, mut stream: TcpStream) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let Some(req) = read_request(&stream)? else { return Ok(()) };
     let local = stream.local_addr()?;
+    let peer = stream.peer_addr()?.ip();
     let head = req.method == "HEAD";
+    let profile = ctx.profile(&req, peer, local.ip());
 
     if req.path.starts_with("/_dlna/") {
         return match &ctx.dlna {
-            Some(dev) => dlna::handle_http(ctx, dev, &req, &mut stream, local),
+            Some(dev) => dlna::handle_http(ctx, dev, &req, &mut stream, local, profile),
             None => respond(&mut stream, "404 Not Found", &[], b"DLNA disabled", head),
         };
     }
 
     if req.method != "GET" && !head {
         return respond(&mut stream, "405 Method Not Allowed", &[("Allow", "GET, HEAD")], b"", false);
+    }
+
+    // A Samsung asking for any version of a video (it may replay an address
+    // it remembered from before the burned-in copy existed, e.g. after
+    // switching input and back) gets the burned-in copy once it exists.
+    if profile == Profile::Samsung && ctx.sub_lang.is_some() {
+        let path = req.path.as_str();
+        let rest = ["/_burn/", "/_mux/", "/_tc/"].iter().find_map(|p| path.strip_prefix(p)).unwrap_or(path.trim_start_matches('/'));
+        let rel = percent_decode(rest, false);
+        if mime_for(&rel).1 == Kind::Video {
+            if let Some(CacheState::Ready(file)) = ctx.samsung_burn(&rel) {
+                let len = fs::metadata(&file)?.len();
+                return serve_file(&mut stream, &req, &file, len, head, &[]);
+            }
+        }
     }
 
     if let Some(rest) = req.path.strip_prefix("/_tc/") {
@@ -319,7 +402,7 @@ fn handle(ctx: &Ctx, mut stream: TcpStream) -> io::Result<()> {
             return respond(&mut stream, "400 Bad Request", &[], b"bad path", head);
         };
         let base = base_url(&req, local);
-        let body = playlist(ctx, &full, &rel, &base);
+        let body = playlist(ctx, &full, &rel, &base, profile);
         return respond(
             &mut stream,
             "200 OK",
@@ -342,6 +425,7 @@ fn handle(ctx: &Ctx, mut stream: TcpStream) -> io::Result<()> {
             let loc = format!("{}/", req.path);
             return respond(&mut stream, "301 Moved Permanently", &[("Location", &loc)], b"", head);
         }
+        // The page is mostly for copying a link into a TV's VLC.
         let html = listing(ctx, &full, &rel, &base_url(&req, local));
         return respond(
             &mut stream,
@@ -537,17 +621,17 @@ pub fn walk_media(dir: &Path, rel: &str, out: &mut Vec<Entry>, depth: usize) {
     }
 }
 
-fn playlist(ctx: &Ctx, dir: &Path, rel: &str, base: &str) -> String {
+fn playlist(ctx: &Ctx, dir: &Path, rel: &str, base: &str, profile: Profile) -> String {
     let mut files = Vec::new();
     walk_media(dir, rel, &mut files, 0);
     files.sort_by(|a, b| natural_cmp(&a.rel, &b.rel));
     let mut s = String::from("#EXTM3U\n");
     for f in files {
         let title = f.rel.replace('/', " / ");
-        let (path, _) = ctx.play_path(&f.rel);
+        let (path, transcoded) = ctx.play_path(&f.rel, profile);
         let title = match ctx.tc_state(&f.rel) {
-            Some(st) => format!("{title} [{}]", tc_note(&st)),
-            None => title,
+            Some(st) if transcoded => format!("{title} [{}]", tc_note(&st)),
+            _ => title,
         };
         s.push_str(&format!("#EXTINF:-1,{title}\n{base}{path}\n"));
     }
@@ -585,7 +669,7 @@ fn listing(ctx: &Ctx, dir: &Path, rel: &str, base: &str) -> String {
             (c, escape_xml(&e.name), human_size(e.size))
         };
         let copy = if !e.is_dir && is_playable(&e.name) {
-            let (path, _) = ctx.play_path(&e.rel);
+            let (path, _) = ctx.play_path(&e.rel, Profile::Tv);
             let tag = ctx.tc_state(&e.rel).map(|st| format!(" ({})", tc_note(&st))).unwrap_or_default();
             format!(" <span class=u>{}{}{tag}</span>", escape_xml(base), escape_xml(&path))
         } else {

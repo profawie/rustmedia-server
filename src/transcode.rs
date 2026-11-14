@@ -29,6 +29,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Instant, SystemTime};
 
@@ -455,7 +456,12 @@ impl Transcoder {
         }
         if status.is_ok_and(|s| s.success()) && std::fs::rename(&part, &target).is_ok() {
             let mins = started.elapsed().as_secs_f64() / 60.0;
-            println!(" Ready for TV (seekable): {name} ({mins:.1} min)");
+            if job.burn.is_some() {
+                println!(" Ready for Samsung (subtitles burned in): {name} ({mins:.1} min)");
+            } else {
+                println!(" Ready for TV (seekable): {name} ({mins:.1} min)");
+            }
+            bump_update_id();
             true
         } else {
             let _ = std::fs::remove_file(&part);
@@ -546,6 +552,7 @@ impl Transcoder {
         match out {
             Ok(o) if o.status.success() && std::fs::rename(&part, &target).is_ok() => {
                 println!(" Subtitles added: {name} ({:.0} s)", started.elapsed().as_secs_f64());
+                bump_update_id();
                 true
             }
             other => {
@@ -559,6 +566,18 @@ impl Transcoder {
             }
         }
     }
+}
+
+/// UPnP SystemUpdateID: bumped whenever a converted or subtitled copy
+/// becomes ready, so TVs that cache folder listings (Samsung) reload them.
+static UPDATES: AtomicU32 = AtomicU32::new(1);
+
+pub fn update_id() -> u32 {
+    UPDATES.load(Ordering::Relaxed)
+}
+
+fn bump_update_id() {
+    UPDATES.fetch_add(1, Ordering::Relaxed);
 }
 
 pub const TC_FEATURES: &str = "DLNA.ORG_OP=00;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=01700000000000000000000000000000";

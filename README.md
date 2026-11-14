@@ -54,6 +54,27 @@ Movie.srt        (or Movie.en.srt, Movie.ms.srt; .srt, .vtt, .ass and .ssa work)
   For other videos use Option B, subtitles embedded in the file, or on the
   laptop Subtitle > Add Subtitle File.
 
+## What each player gets
+
+RustMedia recognises the player and sends the version that suits it:
+
+| Player | Gets |
+|---|---|
+| Samsung TV / Smart Monitor | The original file. With `--sub-lang`, a copy with those subtitles burned into the picture. |
+| VLC on a TV (Google TV, Android TV) | An H.264 copy when the TV can't decode the original (HEVC, 10-bit, ...), with every subtitle as a selectable track. |
+| VLC on a PC or Mac | Always the original file, full quality; its subtitles are offered as tracks. |
+
+Players are told apart by what they report over UPnP (Samsung, Windows/macOS,
+or Linux/Android), and the result is remembered per device, so the
+console shows a line such as `Client 192.168.1.20: Samsung TV ...` the
+first time each one connects. VLC on the laptop running RustMedia counts
+as a PC. Using the playlist link from a Mac or another PC, add
+`?for=pc` (or `?for=tv`) to choose the version yourself:
+
+```
+http://192.168.1.4:8080/playlist.m3u?for=pc
+```
+
 ## Samsung TVs and Smart Monitors (no VLC)
 
 Samsung Tizen TVs and Smart Monitors (e.g. M7) have a built-in DLNA player:
@@ -80,7 +101,9 @@ h264_nvenc` / `h264_qsv` / `h264_amf` is much faster on a GPU). It starts
 the first time the monitor opens the folder; meanwhile the video's name
 ends with "(ms subtitles: burning in N%, open again later)" and the
 original plays. The copies are kept in `.rustmedia-cache`. Burned-in
-subtitles can't be switched off on the monitor.
+subtitles can't be switched off on the monitor. Once the copy exists,
+the monitor always gets it, even if it replays an older link (for example
+after switching input to the PC and back).
 
 Without `--sub-lang`, videos with subtitle files get a copy with those
 files added as subtitle tracks (no re-encoding), which some Samsung models

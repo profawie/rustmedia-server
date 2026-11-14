@@ -154,6 +154,7 @@ fn main() {
         dlna: device,
         tc,
         sub_lang: args.sub_lang.clone(),
+        clients: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     if let Some(tc) = tc {
@@ -190,6 +191,13 @@ fn main() {
     println!();
     println!("   http://{ip}:{port}/playlist.m3u      <- all videos (playlist)");
     println!("   http://{ip}:{port}/                  <- file list (web browser)");
+    println!();
+    println!(" Each player gets its own version of a video:");
+    println!("   Samsung TV      : original file; with --sub-lang, a copy with those");
+    println!("                     subtitles burned into the picture");
+    println!("   TV with VLC     : H.264 copy when needed, all subtitles as tracks");
+    println!("   PC/Mac with VLC : original file, full quality");
+    println!(" A Mac or another PC using the playlist link: add ?for=pc to it.");
     println!();
     if let Some(dev) = device {
         match dlna::start_ssdp(dev, ip, port) {
