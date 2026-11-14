@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
-use crate::http::{read_entries, respond, Ctx, Request};
+use crate::http::{read_entries, respond, Ctx, Profile, Request};
 use crate::transcode::CacheState;
 use crate::util::*;
 
@@ -167,6 +167,7 @@ pub fn handle_http(
     req: &Request,
     stream: &mut TcpStream,
     local: SocketAddr,
+    profile: Profile,
 ) -> io::Result<()> {
     let xml = [("Content-Type", "text/xml; charset=\"utf-8\"")];
     let head = req.method == "HEAD";
@@ -181,7 +182,7 @@ pub fn handle_http(
                 .unwrap_or_default();
             let body = String::from_utf8_lossy(&req.body);
             let base = format!("http://{local}");
-            match control(ctx, &action, &body, &base, crate::http::is_samsung(req)) {
+            match control(ctx, &action, &body, &base, profile) {
                 Some(resp) => respond(stream, "200 OK", &xml, soap(&action, &resp).as_bytes(), false),
                 None => respond(stream, "500 Internal Server Error", &xml, SOAP_FAULT.as_bytes(), false),
             }
@@ -245,21 +246,22 @@ fn xml_arg(body: &str, name: &str) -> Option<String> {
 }
 
 /// Returns the inner response arguments (XML) for a SOAP action.
-fn control(ctx: &Ctx, action: &str, body: &str, base: &str, native: bool) -> Option<String> {
+fn control(ctx: &Ctx, action: &str, body: &str, base: &str, profile: Profile) -> Option<String> {
     match action {
         "Browse" => {
             let id = xml_arg(body, "ObjectID").unwrap_or_else(|| "0".into());
             let flag = xml_arg(body, "BrowseFlag").unwrap_or_default();
             let start: usize = xml_arg(body, "StartingIndex").and_then(|v| v.parse().ok()).unwrap_or(0);
             let count: usize = xml_arg(body, "RequestedCount").and_then(|v| v.parse().ok()).unwrap_or(0);
-            let (didl, returned, total) = browse(ctx, &id, flag == "BrowseMetadata", start, count, base, native)?;
+            let (didl, returned, total) = browse(ctx, &id, flag == "BrowseMetadata", start, count, base, profile)?;
             Some(format!(
                 "<Result>{}</Result><NumberReturned>{returned}</NumberReturned>\
-                 <TotalMatches>{total}</TotalMatches><UpdateID>1</UpdateID>",
-                escape_xml(&didl)
+                 <TotalMatches>{total}</TotalMatches><UpdateID>{}</UpdateID>",
+                escape_xml(&didl),
+                crate::transcode::update_id()
             ))
         }
-        "GetSystemUpdateID" => Some("<Id>1</Id>".into()),
+        "GetSystemUpdateID" => Some(format!("<Id>{}</Id>", crate::transcode::update_id())),
         // Samsung extension: which containers to open for video/audio/photo.
         "X_GetFeatureList" => Some(format!(
             "<FeatureList>{}</FeatureList>",
@@ -320,8 +322,10 @@ pub fn samsung_mime(mime: &'static str) -> &'static str {
     if mime == "video/x-matroska" { "video/x-mkv" } else { mime }
 }
 
-/// `native`: the client plays the original files (Samsung), so no transcoding.
-fn item_xml(ctx: &Ctx, rel: &str, name: &str, size: u64, subs: &[String], base: &str, native: bool) -> String {
+/// What each client gets depends on `profile` (see `Profile`).
+fn item_xml(ctx: &Ctx, rel: &str, name: &str, size: u64, subs: &[String], base: &str, profile: Profile) -> String {
+    // Samsung plays the original files itself (or a burned-in copy).
+    let native = profile == Profile::Samsung;
     let (mime, kind) = mime_for(name);
     let class = match kind {
         Kind::Audio => "object.item.audioItem.musicTrack",
@@ -329,7 +333,7 @@ fn item_xml(ctx: &Ctx, rel: &str, name: &str, size: u64, subs: &[String], base: 
         _ => "object.item.videoItem",
     };
     let title = name.rsplit_once('.').map(|(t, _)| t).filter(|t| !t.is_empty()).unwrap_or(name);
-    let tc_state = if native { None } else { ctx.tc_state(rel) };
+    let tc_state = if profile == Profile::Tv { ctx.tc_state(rel) } else { None };
     // Say in the title when a video can't be seeked yet.
     let title = match &tc_state {
         Some(st @ (CacheState::Converting(_) | CacheState::Waiting | CacheState::Failed)) => {
@@ -340,7 +344,7 @@ fn item_xml(ctx: &Ctx, rel: &str, name: &str, size: u64, subs: &[String], base: 
     // Subtitles. VLC turns every <res> with a text/* protocolInfo into a
     // subtitle track, so all of them are offered. Samsung TVs read
     // sec:CaptionInfoEx, which only holds one (the exact-name match).
-    let (mut path, transcoded) = if native { (format!("/{}", url_encode_path(rel)), false) } else { ctx.play_path(rel) };
+    let (mut path, transcoded) = ctx.play_path(rel, profile);
     // Samsung only lists subtitles inside the file, so it gets a copy with
     // the subtitle files muxed in (made on first browse, takes a minute).
     let mut size = size;
@@ -423,7 +427,7 @@ fn item_xml(ctx: &Ctx, rel: &str, name: &str, size: u64, subs: &[String], base: 
     )
 }
 
-fn browse(ctx: &Ctx, id: &str, metadata: bool, start: usize, count: usize, base: &str, native: bool) -> Option<(String, usize, usize)> {
+fn browse(ctx: &Ctx, id: &str, metadata: bool, start: usize, count: usize, base: &str, profile: Profile) -> Option<(String, usize, usize)> {
     let rel_in = if id == "0" { "" } else { id };
     let (full, rel) = safe_join(&ctx.root, rel_in)?;
     let meta = fs::metadata(&full).ok()?;
@@ -442,7 +446,7 @@ fn browse(ctx: &Ctx, id: &str, metadata: bool, start: usize, count: usize, base:
                 .find(|e| e.rel == rel)
                 .map(|e| e.subs)
                 .unwrap_or_default();
-            didl.push_str(&item_xml(ctx, &rel, &name, meta.len(), &subs, base, native));
+            didl.push_str(&item_xml(ctx, &rel, &name, meta.len(), &subs, base, profile));
         }
         didl.push_str("</DIDL-Lite>");
         return Some((didl, 1, 1));
@@ -459,7 +463,7 @@ fn browse(ctx: &Ctx, id: &str, metadata: bool, start: usize, count: usize, base:
         if e.is_dir {
             didl.push_str(&container_xml(ctx, &e.rel, &e.name));
         } else {
-            didl.push_str(&item_xml(ctx, &e.rel, &e.name, e.size, &e.subs, base, native));
+            didl.push_str(&item_xml(ctx, &e.rel, &e.name, e.size, &e.subs, base, profile));
         }
         returned += 1;
     }
